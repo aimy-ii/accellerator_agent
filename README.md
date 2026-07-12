@@ -1,0 +1,200 @@
+# Accelerator Customer Agent
+
+ИИ-ассистент заказчика для акселератора: собирает ТЗ в диалоге, сохраняет проект,
+подбирает команду, готовит презентацию. LangGraph Server + свой чекпоинтер.
+
+---
+
+## Что делает
+
+```
+guard ──(чат уже отработал)────────────────────────────────► новый чат
+  │
+load_projects → select_project  «Вижу ваши проекты — их N. Доработаем или новый?»
+  ├─ create ─► ask_questions ⇄ more_or_generate ─► generate_spec ─┐
+  └─ edit  ──► load_spec (скрытый контекст) ─► ask_questions ⇄ ... ─► refine_spec ─┤
+                                                                                   ▼
+                                                      confirm_spec ──(правки)──► refine_spec
+                                                             │ (ок)
+                                                      persist_project  (POST/PATCH + файл ТЗ)
+                                                             ▼
+                                                      match_team → present_team ──(ещё)──► match_team
+                                                             │ (достаточно)
+                                                      presentation → finalize
+```
+
+### Ключевые решения
+
+| Решение | Как сделано |
+|---|---|
+| **Токен заказчика** | В `Context` (configurable), **НЕ в state** — state уходит в чекпоинт БД. Обновляется на каждый run. |
+| **Только свои проекты** | `GET /api/customer/projects` — бэк сам фильтрует по владельцу из JWT. |
+| **Не утомлять вопросами** | Максимум 3 вопроса за ход. Как только собран минимум — предлагаем «давайте я сам напишу ТЗ». |
+| **Два генератора ТЗ** | `creative` (мало инфы → ИИ достраивает, всё придуманное → в `assumptions`) и `strict` (много инфы → ИИ ничего не выдумывает). Выбор по `coverage`. |
+| **Правка ТЗ** | Старое ТЗ скачивается из проекта и кладётся в **скрытый контекст** — в чате его не видно, ИИ просто «уже знаком» с проектом. Правка точечная + `change_summary`. |
+| **Подбор команды** | Без векторной базы: LLM мапит роли на справочники платформы → `GET /public/interns/v2` (ANY по стекам) → LLM ранжирует пул. Результат **только в state**, в БД не пишем. |
+| **«Подобрать ещё»** | `exclude_ids` из state (`candidate_ids`) — на клиенте, т.к. `exclude_for_project_id` в API пока нет. |
+| **Конец чата** | После `finalize` любое новое сообщение → детерминированный ответ «заведите новый чат». |
+| **Презентация** | Бизнес-логика заложена целиком: `off` / `local` (python-pptx) / `gamma` (Gamma API, `export_url` временный → качаем сразу). |
+
+---
+
+## Интеграция с API акселератора
+
+Класс `src/api/client.py:AcceleratorAPI` — работает **строго с существующими** ручками:
+
+| Метод | Ручка |
+|---|---|
+| `get_my_projects_flat()` | `GET /api/customer/projects` |
+| `list_my_projects()` | `GET /api/customer/projects/v2` |
+| `create_project()` | `POST /api/customer/create-project` |
+| `update_project()` | `PATCH /api/customer/{id}` |
+| `upload_project_file()` | `POST /api/customer/upload-project-file` |
+| `attach_file_to_project()` | upload → PATCH `files[]` (два шага, как в API) |
+| `search_interns()` | `GET /api/public/interns/v2` |
+| `get_intern()` | `GET /api/public/interns/{id}` |
+| `list_professions()` / `list_stacks()` | `GET /api/public/professions` / `/stacks` |
+| `download_file()` | скачивание файла ТЗ по `file_url` (с кешем) |
+
+**Чего в API ещё нет** (закрыто на клиенте, ручки не эмулируем):
+- `exclude_for_project_id` у `/interns/v2` → исключаем на клиенте;
+- `/specialists/facets` → используем `/professions` + `/stacks`;
+- `project_invitations` → команда живёт в state.
+
+---
+
+## Запуск (dev + LangSmith)
+
+```bash
+python3 -m venv venv && source venv/bin/activate
+pip install -e . "langgraph-cli[inmem]"
+
+cp .env.example .env
+# заполнить: LLM_BASE_URL, LLM_API_KEY, LLM_MODEL,
+#            API_BASE_URL, DEV_USER_TOKEN (JWT заказчика),
+#            LANGSMITH_API_KEY (для трейсинга)
+
+langgraph dev
+```
+
+Studio откроется автоматически. Граф — `customer_agent`.
+
+### Как передать токен в Studio
+
+Токен живёт в **context**, не в state. В Studio открой панель **Configurable** и задай:
+
+```json
+{ "user_token": "<JWT заказчика>", "api_base_url": "http://localhost:8000" }
+```
+
+Для быстрой отладки можно вместо этого прописать `DEV_USER_TOKEN` в `.env` —
+узлы возьмут его, если в context токена нет.
+
+### Первый запуск графа
+
+Input — пустой (`{}`) или с первым сообщением:
+
+```json
+{ "messages": [{ "role": "user", "content": "хочу сделать маркетплейс" }] }
+```
+
+Граф сам сходит за проектами и встанет на паузу с выбором.
+
+### Как отвечать на паузы
+
+Граф встаёт на `interrupt` и отдаёт payload:
+
+```json
+{
+  "kind": "select_project",
+  "message": "Вижу ваши проекты — их 3. Доработаем один из них или создадим новый?",
+  "choices": [
+    { "id": "new", "title": "Создать новый проект" },
+    { "id": 42, "title": "Маркетплейс", "status": "draft", "has_spec": true }
+  ]
+}
+```
+
+Ответ — `Command(resume=...)`. В Studio просто вводится значение:
+
+```json
+{ "id": 42 }        // выбрал проект
+{ "id": "new" }     // новый проект
+{ "text": "хочу маркетплейс книг, оплата картой" }   // ответ на вопросы
+{ "id": "generate" }  // «составьте ТЗ сами»
+{ "id": "ok" }        // подтвердил ТЗ
+{ "id": "more" }      // подобрать ещё специалистов
+```
+
+### Типы пауз (контракт с фронтом)
+
+| `kind` | Когда | Что во `choices` / `data` |
+|---|---|---|
+| `select_project` | старт | `choices`: `new` + проекты заказчика |
+| `ask_questions` | сбор требований | `data.questions[]` (`id`, `text`, `hint`) |
+| `more_or_generate` | минимум собран | `choices`: `generate` / `more`; `data.missing_topics` |
+| `confirm_spec` | ТЗ готово | `choices`: `ok` / `edit`; `data`: полный ТЗ, `assumptions`, `changes`, `roles_needed` |
+| `team_ready` | команда подобрана | `choices`: `done` / `more`; `data.team` |
+
+---
+
+## Прод
+
+```bash
+langgraph build -t accelerator_agent
+langgraph up --wait          # поднимет LangGraph Server + Postgres + Redis
+```
+
+Наружу LangGraph Server **не выставлять** — только через свой FastAPI-шлюз
+(он валидирует заказчика и прокидывает JWT в `context` на каждый run).
+
+```bash
+ufw allow 22
+ufw allow 8000     # только шлюз
+# 8123 (LangGraph) и 5433 (Postgres) — закрыты
+```
+
+---
+
+## Что взято из ML-сервиса
+
+**Перенесено (ценное):**
+- правила генерации ТЗ: структура документа, иерархическая нумерация, запрет на
+  выдумывание функционала, запрет на разделы «план внедрения/следующие шаги»;
+- точечная правка ТЗ + `change_summary` (из `refine_artifact`);
+- логика оценки достаточности информации (из `requirements_analyzer`) — но без
+  трёх отдельных LLM-вызовов: состояние держит LangGraph;
+- маппинг ролей и отбор кандидатов (из `roles_generation`, `candidate_selector`) —
+  переписаны под реальные фильтры API вместо векторной базы;
+- презентация через Gamma (`export_url` временный → скачиваем сразу).
+
+**Не перенесено (костыли / не в скоупе):**
+- Chroma + `team/match` — подбор идёт через ручки акселератора;
+- ручной чек-лист диалога (`was_asked` / `is_answered`) — это стейт-машина руками,
+  её роль берёт на себя LangGraph;
+- `team_roadmap_pipeline` — императивно сшитый пайплайн, в графе он не нужен;
+- roadmap-генераторы — не в скоупе;
+- транскрибация — по договорённости не делаем.
+
+---
+
+## Структура
+
+```
+src/
+├── core/config.py            # pydantic-settings
+├── utils/llm_gen.py          # ChatOpenAI + прокси + ретраи + семафор
+├── api/
+│   ├── client.py             # AcceleratorAPI — класс с методами
+│   ├── documents.py          # извлечение текста ТЗ (md/docx/pdf)
+│   └── errors.py
+├── requirements_flow/        # сбор требований (вопросы + оценка)
+├── techspec/                 # ТЗ: creative / strict / refine
+├── team/                     # подбор команды
+├── presentation/             # презентация (off / local / gamma)
+└── graph/
+    ├── state.py              # AgentState + Context (токен здесь, не в state)
+    ├── interrupts.py         # human_gate, payload, разбор ответов
+    ├── nodes.py              # узлы
+    └── graph.py              # сборка + условные рёбра
+```
