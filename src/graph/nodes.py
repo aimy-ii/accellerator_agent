@@ -1,11 +1,17 @@
 """Узлы графа — тонкая обёртка над сервисами, без бизнес-логики внутри.
 
 Поток:
-    guard → load_projects → select_project → [create | edit]
-      create: ask_questions ⇄ more_or_generate → generate_spec (creative|strict)
+    guard → load_projects → select_project
+      create: ask_questions ⇄ more_or_generate → create_project → generate_spec
       edit:   load_spec (скрытый контекст) → ask_questions ⇄ ... → refine_spec
-    → confirm_spec → persist_project (create: POST / edit: PATCH + файл ТЗ)
-    → match_team → present_team → presentation → finalize
+    → confirm_spec
+        ├─► attach_spec   (файл ТЗ → проект)   ┐ ПАРАЛЛЕЛЬНО
+        └─► match_team    (подбор спецов)      ┘
+    → present_team → presentation → finalize
+
+Проект создаётся ДО генерации ТЗ — заказчик видит его в списке, пока ИИ пишет.
+Каждый шаг публикует прогресс (emit) — фронт видит, что происходит.
+Каждый ввод пользователя падает в messages — диалог листается как чат.
 """
 from __future__ import annotations
 
@@ -31,10 +37,13 @@ from src.graph.interrupts import (
     render_choices,
     resolve,
 )
+from src.graph.progress import emit, progress_for
 from src.graph.state import AgentState, Context
 from src.presentation.service import build_presentation
-from src.requirements_flow.service import assess_info, next_questions
+from src.requirements_flow.service import next_questions
 from src.team.service import collect_candidate_ids, match_team, merge_team
+from src.techspec.card import make_card
+from src.techspec.render import DOCX_MIME, markdown_to_docx
 from src.techspec.service import generate_spec, refine_spec, spec_file_name
 from src.utils.llm_gen import LLMOverloadedError
 
@@ -115,6 +124,24 @@ def _say(text: str) -> dict:
     return {"messages": [AIMessage(content=text)]}
 
 
+def _turn(question: str, reply: Reply, choices: list[Choice] | None = None) -> list:
+    """Пара реплик для истории чата: вопрос агента + ответ пользователя.
+
+    Всё, что пользователь выбрал или ввёл, попадает в messages — чтобы
+    диалог можно было пролистать как обычный чат.
+    Нажал кнопку → в чате видно название кнопки, а не сырой id.
+    """
+    from langchain_core.messages import HumanMessage
+
+    said = reply.text.strip()
+    if not said and reply.id is not None and choices:
+        said = next(
+            (c.title for c in choices if str(c.id) == str(reply.id)),
+            str(reply.id),
+        )
+    return [AIMessage(content=question), HumanMessage(content=said or "(без ответа)")]
+
+
 # ─── 0. guard: чат уже отработал ────────────────────────────────────────────
 
 async def guard_node(state: AgentState, runtime: Runtime[Context]) -> dict:
@@ -131,9 +158,10 @@ async def load_projects_node(state: AgentState, runtime: Runtime[Context]) -> di
     if state.get("projects"):
         return {}
     try:
+        emit("load_projects", "Смотрю ваши проекты…")
         api = _api(runtime)
         projects = await api.get_my_projects_flat()
-        log.info("Проектов у заказчика: %d", len(projects))
+        emit("load_projects", f"Нашёл проектов: {len(projects)}")
         return {"projects": projects}
     except Exception as exc:  # noqa: BLE001
         return {"error": f"Не удалось получить ваши проекты: {exc}"}
@@ -170,23 +198,21 @@ async def select_project_node(state: AgentState, runtime: Runtime[Context]) -> d
 
     reply = ask(Ask(kind=KIND_SELECT_PROJECT, message=message, choices=choices))
     choice = await resolve(reply, choices)
+    turn = _turn(message, reply, choices)
 
     if choice == "new":
-        return {"mode": "create", "messages": [AIMessage(content="Создаём новый проект.")]}
+        emit("select_project", "Создаём новый проект")
+        return {"mode": "create", "messages": turn}
 
     if isinstance(choice, int):
         title = next(c.title for c in choices if c.id == choice)
-        return {
-            "mode": "edit",
-            "target_project_id": choice,
-            "messages": [AIMessage(content=f"Работаем с проектом «{title}».")],
-        }
+        emit("select_project", f"Работаем с проектом «{title}»")
+        return {"mode": "edit", "target_project_id": choice, "messages": turn}
 
     # Не разобрали — переспрашиваем (ребро ведёт обратно в этот же узел).
     return {
-        "messages": [
-            AIMessage(content="Не понял выбор. Назовите проект из списка или скажите «новый».")
-        ]
+        "messages": turn
+        + [AIMessage(content="Не понял выбор. Назовите проект из списка или скажите «новый».")]
     }
 
 
@@ -203,6 +229,7 @@ async def load_spec_node(state: AgentState, runtime: Runtime[Context]) -> dict:
 
     project_id = state.get("target_project_id")
     try:
+        emit("load_spec", "Поднимаю техническое задание проекта…")
         api = _api(runtime)
         project = await api.get_project(int(project_id))
         if not project:
@@ -245,6 +272,7 @@ async def ask_questions_node(state: AgentState, runtime: Runtime[Context]) -> di
         return {}
 
     try:
+        emit("ask_questions", "Думаю, что уточнить…")
         batch = await next_questions(
             _dialog(state),
             spec_context=state.get("existing_spec_text"),
@@ -254,82 +282,123 @@ async def ask_questions_node(state: AgentState, runtime: Runtime[Context]) -> di
     except Exception as exc:  # noqa: BLE001
         return {"error": f"Не удалось сформулировать вопросы: {exc}"}
 
+    # Оценка пришла тем же вызовом — отдельный поход к модели не нужен.
+    assessment = {
+        "coverage": batch.coverage,
+        "missing_topics": batch.missing_topics,
+        "can_generate": batch.can_generate,
+    }
+
     if not batch.has_questions or not batch.message.strip():
-        return {"ready_to_generate": True}
+        return {**assessment, "ready_to_generate": True}
 
     reply = ask(Ask(kind=KIND_ASK_QUESTIONS, message=batch.message))
 
-    from langchain_core.messages import HumanMessage
-
     return {
-        "messages": [
-            AIMessage(content=batch.message),
-            HumanMessage(content=reply.text or "(без ответа)"),
-        ],
+        **assessment,
+        "messages": _turn(batch.message, reply),
         "question_rounds": int(state.get("question_rounds") or 0) + 1,
     }
 
 
 async def more_or_generate_node(state: AgentState, runtime: Runtime[Context]) -> dict:
-    """Оценивает собранное и спрашивает: ещё вопросы или уже писать ТЗ?
+    """Спрашивает: ещё вопросы или уже писать ТЗ.
 
-    Ключевое требование продукта: не утомлять. Как только минимума хватает —
-    сразу предлагаем «давайте я сам напишу».
+    LLM здесь НЕ вызывается — оценка достаточности пришла вместе с вопросами
+    (ask_questions). Узел только показывает паузу: это мгновенно.
     """
     if _skip_on_error(state) or state.get("ready_to_generate"):
         return {}
 
-    try:
-        assessment = await assess_info(
-            _dialog(state),
-            spec_context=state.get("existing_spec_text"),
-        )
-    except LLMOverloadedError as exc:
-        return {"error": str(exc)}
-    except Exception as exc:  # noqa: BLE001
-        return {"error": f"Не удалось оценить собранную информацию: {exc}"}
+    coverage = state.get("coverage") or "workable"
 
-    updates: dict[str, Any] = {
-        "coverage": assessment.coverage,
-        "missing_topics": assessment.missing_topics,
-    }
+    # Всё раскрыто — спрашивать нечего, сразу к ТЗ.
+    if coverage == "rich":
+        return {"ready_to_generate": True}
 
-    rounds = int(state.get("question_rounds") or 0)
-
-    # Минимума ещё нет и вопросов задали мало — молча идём спрашивать дальше.
-    if not assessment.can_generate and rounds < settings.min_question_rounds + 1:
-        return updates
-
-    if assessment.coverage == "rich" or not assessment.missing_topics:
-        updates["ready_to_generate"] = True
-        return updates
-
+    # ВСЕГДА даём выбор. Решает заказчик, а не наш if: даже если данных мало,
+    # он вправе сказать «пиши как есть».
     choices = [
         Choice(id="generate", title="Составьте ТЗ сами"),
         Choice(id="more", title="Задайте ещё вопросы"),
     ]
-    message = (
-        "Основное я понял. Могу задать ещё пару уточняющих вопросов — "
-        "тогда ТЗ будет точнее. Или соберу техническое задание сам из того, "
-        "что есть, а вы потом поправите. Как удобнее?"
-    )
+    if coverage == "thin":
+        message = (
+            "Идею понял, но деталей пока немного — ТЗ придётся во многом "
+            "додумывать за вас (всё придуманное я честно помечу, поправите). "
+            "Могу задать ещё пару вопросов — тогда точнее. Или собрать ТЗ "
+            "сейчас из того, что есть. Как удобнее?"
+        )
+    else:
+        message = (
+            "Основное я понял. Могу задать ещё пару уточняющих вопросов — "
+            "тогда ТЗ будет точнее. Или соберу техническое задание сам из того, "
+            "что есть, а вы потом поправите. Как удобнее?"
+        )
 
     reply = ask(
         Ask(
             kind=KIND_MORE_OR_GENERATE,
             message=message,
             choices=choices,
-            data={"missing_topics": assessment.missing_topics},
+            data={"missing_topics": state.get("missing_topics") or []},
         )
     )
     choice = await resolve(reply, choices)
 
     # Не разобрали ответ — не мучаем вопросами, пишем ТЗ (дефолт «не утомлять»).
-    updates["ready_to_generate"] = choice != "more"
-    return updates
+    return {
+        "ready_to_generate": choice != "more",
+        "messages": _turn(message, reply, choices),
+    }
 
 
-# ─── 4. генерация / правка ТЗ ───────────────────────────────────────────────
+# ─── 4. создание проекта (ДО генерации ТЗ) ─────────────────────────────────
+
+async def create_project_node(state: AgentState, runtime: Runtime[Context]) -> dict:
+    """Заводит проект в БД СРАЗУ после сбора требований — до написания ТЗ.
+
+    Заказчик видит проект в списке, пока ИИ ещё пишет техническое задание.
+    Файл ТЗ прикрепится позже, отдельным узлом (параллельно с подбором команды).
+
+    В режиме edit проект уже есть — узел ничего не делает.
+    """
+    if _skip_on_error(state) or state.get("target_project_id"):
+        return {}
+
+    try:
+        emit("create_project", "Оформляю карточку проекта…")
+        card = await make_card(_dialog(state))
+
+        api = _api(runtime)
+        created = await api.create_project(
+            {
+                "title": card.title[:255],
+                "description": card.description,
+                "required_specialists": [],
+                "files": [],
+            }
+        )
+        project_id = int(created["id"])
+        emit("create_project", f"Проект «{card.title}» создан")
+
+        return {
+            "target_project_id": project_id,
+            "spec_title": card.title,
+            "spec_summary": card.description,
+            "messages": [
+                AIMessage(
+                    content=f"Создал проект «{card.title}». Теперь пишу техническое задание."
+                )
+            ],
+        }
+    except LLMOverloadedError as exc:
+        return {"error": str(exc)}
+    except Exception as exc:  # noqa: BLE001
+        return {"error": f"Не удалось создать проект: {exc}"}
+
+
+# ─── 5. генерация / правка ТЗ ───────────────────────────────────────────────
 
 async def generate_spec_node(state: AgentState, runtime: Runtime[Context]) -> dict:
     """Пишет ТЗ с нуля.
@@ -345,6 +414,7 @@ async def generate_spec_node(state: AgentState, runtime: Runtime[Context]) -> di
     creative = coverage != "rich"
 
     try:
+        emit("generate_spec", "Пишу техническое задание…")
         spec = await generate_spec(
             _dialog(state),
             creative=creative,
@@ -355,12 +425,13 @@ async def generate_spec_node(state: AgentState, runtime: Runtime[Context]) -> di
     except Exception as exc:  # noqa: BLE001
         return {"error": f"Не удалось составить ТЗ: {exc}"}
 
+    emit("generate_spec", "Техническое задание готово")
     return {
-        "spec_title": spec.title,
-        "spec_summary": spec.summary,
+        # title/summary приходят из create_project (идёт параллельно) — не перетираем
         "spec_text": spec.tech_spec_text,
         "spec_assumptions": spec.assumptions,
         "roles_needed": spec.roles_needed,
+        "messages": [AIMessage(content="Техническое задание готово.")],
     }
 
 
@@ -375,6 +446,7 @@ async def refine_spec_node(state: AgentState, runtime: Runtime[Context]) -> dict
         return await generate_spec_node(state, runtime)
 
     try:
+        emit("refine_spec", "Вношу правки в техническое задание…")
         refined = await refine_spec(current, _dialog(state))
     except LLMOverloadedError as exc:
         return {"error": str(exc)}
@@ -436,69 +508,62 @@ async def confirm_spec_node(state: AgentState, runtime: Runtime[Context]) -> dic
         )
     )
     choice = await resolve(reply, choices)
+    turn = _turn(message, reply, choices)
 
     if choice == "ok":
         return {
             "spec_confirmed": True,
-            "messages": [AIMessage(content="Принято. Подбираю команду.")],
+            "messages": turn + [AIMessage(content="Принято. Сохраняю ТЗ и подбираю команду.")],
         }
 
-    from langchain_core.messages import HumanMessage
-
     # Кнопка «Нужны правки» ИЛИ свободный текст с замечаниями — круг правки.
-    feedback = reply.text or "Нужны правки"
     return {
         "spec_confirmed": False,
         "existing_spec_text": state.get("spec_text"),
         "spec_changes": [],
-        "messages": [HumanMessage(content=feedback)],
+        "messages": turn,
     }
 
 
-# ─── 5. сохранение проекта + файл ТЗ ────────────────────────────────────────
+# ─── 6. прикрепление файла ТЗ (параллельно с подбором) ──────────────────────
 
-async def persist_project_node(state: AgentState, runtime: Runtime[Context]) -> dict:
-    """Создаёт проект (create) или обновляет (edit) и крепит файл ТЗ.
+async def attach_spec_node(state: AgentState, runtime: Runtime[Context]) -> dict:
+    """Прикрепляет файл ТЗ к проекту. Идёт ПАРАЛЛЕЛЬНО с подбором команды.
 
-    В режиме create проект появляется в БД ТОЛЬКО здесь — когда собраны все
-    поля и ТЗ подтверждено. Никаких пустышек-черновиков.
+    Проект уже создан (create_project), поэтому здесь только:
+      upload файла → PATCH проекта с files[] → заодно освежаем title/описание.
     """
     if _skip_on_error(state):
         return {}
 
+    project_id = state.get("target_project_id")
+    if not project_id:
+        return {"error": "Проект не создан — некуда прикреплять ТЗ"}
+
     api = _api(runtime)
-    title = state.get("spec_title") or "Проект без названия"
-    description = state.get("spec_summary") or ""
+    title = state.get("spec_title") or "Проект"
     spec_text = state.get("spec_text") or ""
 
     try:
-        project_id = state.get("target_project_id")
+        emit("attach_spec", "Сохраняю ТЗ в проект…")
 
-        if state.get("mode") == "create":
-            created = await api.create_project(
-                {
-                    "title": title[:255],
-                    "description": description,
-                    "required_specialists": [],
-                    "files": [],
-                }
-            )
-            project_id = int(created["id"])
-            log.info("Проект создан: #%s «%s»", project_id, title)
-        else:
+        if state.get("mode") == "edit":
             await api.update_project(
                 int(project_id),
-                {"title": title[:255], "description": description},
+                {"description": state.get("spec_summary") or ""},
             )
-            log.info("Проект обновлён: #%s", project_id)
 
         version = 2 if state.get("mode") == "edit" else 1
         file_name = spec_file_name(title, version=version)
+
+        # Бэкенд принимает docx, а не markdown — конвертируем (pandoc).
+        content = markdown_to_docx(spec_text)
+
         updated = await api.attach_file_to_project(
             int(project_id),
             file_name,
-            spec_text.encode("utf-8"),
-            mime_type="text/markdown",
+            content,
+            mime_type=DOCX_MIME,
         )
         file_url = next(
             (
@@ -508,19 +573,16 @@ async def persist_project_node(state: AgentState, runtime: Runtime[Context]) -> 
             ),
             None,
         )
-        log.info("ТЗ прикреплено к проекту #%s: %s", project_id, file_name)
+        emit("attach_spec", f"ТЗ прикреплено: {file_name}")
 
         return {
-            "target_project_id": project_id,
             "spec_file_url": file_url,
             "messages": [
-                AIMessage(
-                    content=f"Техническое задание сохранено в проекте «{title}»."
-                )
+                AIMessage(content=f"Техническое задание сохранено в проекте «{title}».")
             ],
         }
     except Exception as exc:  # noqa: BLE001
-        return {"error": f"Не удалось сохранить проект: {exc}"}
+        return {"error": f"Не удалось сохранить ТЗ в проект: {exc}"}
 
 
 # ─── 6. подбор команды (в state, БЕЗ записи в БД) ───────────────────────────
@@ -538,6 +600,7 @@ async def match_team_node(state: AgentState, runtime: Runtime[Context]) -> dict:
             state.get("spec_summary") or "",
             api,
             exclude_ids=state.get("candidate_ids") or [],
+            progress=progress_for("match_team"),
         )
     except LLMOverloadedError as exc:
         return {"error": str(exc)}
@@ -577,25 +640,21 @@ async def present_team_node(state: AgentState, runtime: Runtime[Context]) -> dic
         Choice(id="more", title="Подобрать ещё"),
     ]
 
+    message = "\n".join(lines)
     reply = ask(
         Ask(
             kind=KIND_TEAM_READY,
-            message="\n".join(lines),
+            message=message,
             choices=choices,
             data={"team": team},
         )
     )
     choice = await resolve(reply, choices)
+    turn = _turn(message, reply, choices)
 
     if choice == "more":
-        return {
-            "wants_more_candidates": True,
-            "messages": [AIMessage(content="Ищу ещё кандидатов.")],
-        }
-    return {
-        "wants_more_candidates": False,
-        "messages": [AIMessage(content="Хорошо, подборку зафиксировал.")],
-    }
+        return {"wants_more_candidates": True, "messages": turn}
+    return {"wants_more_candidates": False, "messages": turn}
 
 
 # ─── 7. презентация (бизнес-логика; включается флагом) ──────────────────────
@@ -612,6 +671,7 @@ async def presentation_node(state: AgentState, runtime: Runtime[Context]) -> dic
         return {}
 
     try:
+        emit("presentation", "Собираю презентацию проекта…")
         api = _api(runtime)
         result = await build_presentation(
             state.get("spec_text") or "",

@@ -15,6 +15,7 @@ src/graph/__init__.py
 src/graph/graph.py
 src/graph/interrupts.py
 src/graph/nodes.py
+src/graph/progress.py
 src/graph/state.py
 src/presentation/__init__.py
 src/presentation/models.py
@@ -29,8 +30,10 @@ src/team/models.py
 src/team/prompts.py
 src/team/service.py
 src/techspec/__init__.py
+src/techspec/card.py
 src/techspec/models.py
 src/techspec/prompts.py
+src/techspec/render.py
 src/techspec/service.py
 src/utils/__init__.py
 src/utils/llm_gen.py

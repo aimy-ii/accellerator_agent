@@ -44,6 +44,7 @@ class AgentState(TypedDict, total=False):
     # ── сбор требований ─────────────────────────────────────────────────────
     question_rounds: int            # сколько ходов вопросов уже задали
     coverage: Optional[str]         # thin | workable | rich
+    can_generate: bool              # хватает ли данных на ТЗ (оценка от LLM)
     missing_topics: list[str]
     ready_to_generate: bool         # заказчик сказал «хватит, пиши ТЗ»
 
@@ -75,6 +76,7 @@ def new_state_defaults() -> dict[str, Any]:
     return {
         "projects": [],
         "missing_topics": [],
+        "can_generate": False,
         "spec_assumptions": [],
         "spec_changes": [],
         "roles_needed": [],

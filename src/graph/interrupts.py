@@ -156,7 +156,7 @@ async def resolve(reply: Reply, choices: list[Choice]) -> str | int | None:
 
     options = "\n".join(f"- id={c.id}: {c.title}" for c in choices)
     try:
-        async with get_llm(temperature=0.0) as llm:
+        async with get_llm(temperature=0.0, fast=True) as llm:
             structured = llm.with_structured_output(_Match)
             match: _Match = await ainvoke_llm(
                 structured,

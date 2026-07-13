@@ -23,7 +23,7 @@ async def next_questions(
     spec_context: str | None = None,
 ) -> QuestionBatch:
     """Возвращает готовую реплику с вопросами (или has_questions=False)."""
-    async with get_llm(temperature=0.3) as llm:
+    async with get_llm(temperature=0.3, fast=True) as llm:
         structured = llm.with_structured_output(QuestionBatch)
         result: QuestionBatch = await ainvoke_llm(
             structured,
@@ -34,7 +34,12 @@ async def next_questions(
                 ),
             ],
         )
-    log.info("Вопросы: has_questions=%s", result.has_questions)
+    log.info(
+        "Вопросы: has_questions=%s coverage=%s can_generate=%s",
+        result.has_questions,
+        result.coverage,
+        result.can_generate,
+    )
     return result
 
 
@@ -44,7 +49,7 @@ async def assess_info(
     spec_context: str | None = None,
 ) -> InfoAssessment:
     """Оценивает, достаточно ли данных для ТЗ и насколько плотно они покрыты."""
-    async with get_llm(temperature=0.0) as llm:
+    async with get_llm(temperature=0.0, fast=True) as llm:
         structured = llm.with_structured_output(InfoAssessment)
         result: InfoAssessment = await ainvoke_llm(
             structured,

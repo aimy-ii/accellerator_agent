@@ -31,9 +31,13 @@ class Settings(BaseSettings):
     # ─── LLM (OpenRouter / kodik_router / локальная — OpenAI-совместимая) ────
     llm_base_url: str | None = None
     llm_api_key: str | None = None
+    # Тяжёлая модель — только на генерацию/правку ТЗ (длинный документ).
     llm_model: str = "local-model"
+    # Быстрая модель — всё остальное: вопросы, карточка проекта, распознавание
+    # ответа, маппинг ролей, ранжирование кандидатов. Пусто → берётся llm_model.
+    llm_model_fast: str | None = None
     llm_temperature: float = 0.2
-    llm_max_concurrency: int = 3
+    llm_max_concurrency: int = 6
 
     # ─── Прокси для LLM (IS_PROXY=true) ─────────────────────────────────────
     is_proxy: bool = False
@@ -90,6 +94,11 @@ class Settings(BaseSettings):
     def api_prefix(self) -> str:
         """Полный базовый URL API акселератора (с /api)."""
         return f"{self.api_base_url.rstrip('/')}/api"
+
+    @property
+    def fast_model(self) -> str:
+        """Модель для коротких задач. Нет отдельной — берём основную."""
+        return self.llm_model_fast or self.llm_model
 
     @property
     def proxy_url(self) -> str | None:

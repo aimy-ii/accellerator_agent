@@ -94,7 +94,7 @@ def slugify(title: str) -> str:
 
 
 def spec_file_name(title: str, *, version: int = 1) -> str:
-    """Имя файла ТЗ: TZ_<slug>_v<N>_<дата>.md."""
+    """Имя файла ТЗ: TZ_<slug>_v<N>_<дата>.docx (бэкенд не принимает .md)."""
     stamp = datetime.now(timezone.utc).strftime("%Y%m%d")
     suffix = f"_v{version}" if version > 1 else ""
-    return f"TZ_{slugify(title)}{suffix}_{stamp}.md"
+    return f"TZ_{slugify(title)}{suffix}_{stamp}.docx"

@@ -11,7 +11,9 @@
 """
 from __future__ import annotations
 
+import asyncio
 import logging
+from typing import Callable
 
 from langchain_core.messages import HumanMessage, SystemMessage
 
@@ -44,7 +46,7 @@ async def map_roles_to_filters(
         len(stacks),
     )
 
-    async with get_llm(temperature=0.0) as llm:
+    async with get_llm(temperature=0.0, fast=True) as llm:
         structured = llm.with_structured_output(RoleQueries)
         result: RoleQueries = await ainvoke_llm(
             structured,
@@ -77,7 +79,7 @@ async def rank_candidates(
     if not candidates:
         return RankedTeam(candidates=[])
 
-    async with get_llm(temperature=0.2) as llm:
+    async with get_llm(temperature=0.2, fast=True) as llm:
         structured = llm.with_structured_output(RankedTeam)
         result: RankedTeam = await ainvoke_llm(
             structured,
@@ -101,47 +103,57 @@ async def match_team(
     api: AcceleratorAPI,
     *,
     exclude_ids: list[int] | None = None,
+    progress: Callable[[str], None] | None = None,
 ) -> list[dict]:
-    """Подбирает команду под проект.
+    """Подбирает команду под проект. Все роли — ПАРАЛЛЕЛЬНО.
+
+    На роль отдаём count + 1 кандидата (count берётся из ТЗ; нет — считаем 1),
+    чтобы у заказчика был выбор, но без лишнего перебора.
 
     Args:
         exclude_ids: кого не показывать (уже в подборке) — для «подобрать ещё».
+        progress: колбэк прогресса (пишет в стрим для фронта).
 
     Returns:
-        Список блоков по ролям:
-        [{"role": str, "profession_ids": [...], "candidates": [
-            {"intern_id", "name", "profession", "match_reason", "score", "profile"}
-        ]}]
+        [{"role", "profession_ids", "count", "candidates": [...]}, ...]
     """
-    exclude = list(exclude_ids or [])
+    def say(text: str) -> None:
+        if progress:
+            progress(text)
+
+    say("Разбираю, какие специалисты нужны проекту…")
     role_queries = await map_roles_to_filters(roles, spec_text, api)
 
-    result: list[dict] = []
-    for rq in role_queries.roles:
+    if not role_queries.roles:
+        return []
+
+    exclude = list(exclude_ids or [])
+
+    async def _one_role(rq) -> dict:
+        """Полный цикл по одной роли: выборка → ранжирование."""
+        want = rq.count + 1  # count из ТЗ + 1 запасной, чтобы было из чего выбрать
+        say(f"Ищу: {rq.role}…")
+
         pool = await api.search_interns(
             profession_ids=rq.profession_ids or None,
             stack_ids=rq.stack_ids or None,
             exclude_ids=exclude,
-            per_page=settings.candidates_pool_size,
+            per_page=want,
         )
-        log.info("Роль '%s': пул кандидатов=%d", rq.role, len(pool))
+        log.info("Роль '%s': нужно %d, нашлось %d", rq.role, want, len(pool))
 
         if not pool:
-            result.append(
-                {
-                    "role": rq.role,
-                    "profession_ids": rq.profession_ids,
-                    "count": rq.count,
-                    "candidates": [],
-                    "note": "На платформе пока нет подходящих специалистов по этим фильтрам",
-                }
-            )
-            continue
+            return {
+                "role": rq.role,
+                "profession_ids": rq.profession_ids,
+                "count": rq.count,
+                "candidates": [],
+                "note": "На платформе пока нет подходящих специалистов",
+            }
 
-        top_n = max(settings.candidates_per_role, rq.count)
-        ranked = await rank_candidates(rq.role, spec_summary, pool, top_n=top_n)
-
+        ranked = await rank_candidates(rq.role, spec_summary, pool, top_n=want)
         by_id = {int(c["id"]): c for c in pool}
+
         candidates: list[dict] = []
         for rc in ranked.candidates:
             profile = by_id.get(rc.intern_id)
@@ -160,18 +172,17 @@ async def match_team(
                     "profile": profile,
                 }
             )
-            exclude.append(rc.intern_id)
 
-        result.append(
-            {
-                "role": rq.role,
-                "profession_ids": rq.profession_ids,
-                "count": rq.count,
-                "candidates": candidates,
-            }
-        )
+        say(f"{rq.role}: подобрано {len(candidates)}")
+        return {
+            "role": rq.role,
+            "profession_ids": rq.profession_ids,
+            "count": rq.count,
+            "candidates": candidates,
+        }
 
-    return result
+    # Все роли разом — не в очереди.
+    return list(await asyncio.gather(*[_one_role(rq) for rq in role_queries.roles]))
 
 
 def collect_candidate_ids(team: list[dict]) -> list[int]:

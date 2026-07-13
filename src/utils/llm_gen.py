@@ -83,11 +83,27 @@ def _raw_error_payload(exc: BaseException) -> str:
     return str(data)
 
 
+# Провайдер может сорвать structured output посреди стрима — это лечится повтором.
+_PROVIDER_GLITCHES = (
+    "json error",
+    "sse stream",
+    "upstream",
+    "invalid json",
+    "unexpected end",
+    "incomplete",
+)
+
+
 def _is_retryable(exc: BaseException) -> bool:
     """Проверяет, стоит ли повторить LLM-вызов."""
     status = _status_code(exc)
     if status == 429 or (status is not None and 500 <= status < 600):
         return True
+
+    text = f"{exc} {_raw_error_payload(exc)}".lower()
+    if any(glitch in text for glitch in _PROVIDER_GLITCHES):
+        return True
+
     return isinstance(
         exc,
         (
@@ -152,9 +168,22 @@ async def ainvoke_llm(runnable, messages):
 
 
 @asynccontextmanager
-async def get_llm(temperature: float | None = None) -> AsyncIterator[ChatOpenAI]:
-    """Async-клиент OpenAI-совместимой LLM. Прокси из settings, соединение закрывается на выходе."""
+async def get_llm(
+    temperature: float | None = None,
+    *,
+    fast: bool = False,
+) -> AsyncIterator[ChatOpenAI]:
+    """Async-клиент OpenAI-совместимой LLM.
+
+    Args:
+        fast: True — быстрая модель (LLM_MODEL_FAST): вопросы, карточка проекта,
+            распознавание ответа, подбор. False — тяжёлая (LLM_MODEL): только ТЗ.
+
+    Стриминг выключен: structured output нужен целиком, поток токенов только
+    добавляет задержку.
+    """
     temp = temperature if temperature is not None else settings.llm_temperature
+    model = settings.fast_model if fast else settings.llm_model
     client_kwargs: dict = {
         "verify": HTTP_VERIFY,
         "timeout": httpx.Timeout(
@@ -177,8 +206,10 @@ async def get_llm(temperature: float | None = None) -> AsyncIterator[ChatOpenAI]
         yield ChatOpenAI(
             base_url=settings.llm_base_url,
             api_key=settings.llm_api_key or "not-needed",
-            model=settings.llm_model,
+            model=model,
             temperature=temp,
+            streaming=False,
+            disable_streaming=True,
             http_async_client=http_client,
             # LangChain ломает транспорт httpx при SOCKS без этого:
             # https://github.com/langchain-ai/langchain/issues/11334

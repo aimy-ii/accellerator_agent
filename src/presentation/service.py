@@ -30,7 +30,7 @@ log = logging.getLogger(__name__)
 
 async def generate_deck(spec_text: str, roles: list[str]) -> Deck:
     """Генерирует структуру презентации по ТЗ."""
-    async with get_llm(temperature=0.3) as llm:
+    async with get_llm(temperature=0.3, fast=True) as llm:
         structured = llm.with_structured_output(Deck)
         deck: Deck = await ainvoke_llm(
             structured,
