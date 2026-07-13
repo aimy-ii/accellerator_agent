@@ -50,13 +50,17 @@ def map_roles_user_message(
     stacks: list[dict],
     spec_text: str,
 ) -> str:
-    """User-сообщение для маппинга ролей на справочники."""
+    """User-сообщение для маппинга ролей на справочники.
+
+    Полное ТЗ сюда НЕ кладём: роли уже извлечены, а справочники платформы
+    и так занимают место. Достаточно короткой выжимки — про что проект.
+    """
     prof_list = [{"id": p["id"], "name": p.get("name", "")} for p in professions]
     stack_list = [{"id": s["id"], "name": s.get("name", "")} for s in stacks]
 
     return (
-        f"Роли проекта: {', '.join(roles) if roles else '(не указаны — выведи из ТЗ)'}\n\n"
-        f"ТЗ проекта (фрагмент):\n---\n{spec_text[:6000]}\n---\n\n"
+        f"Роли, которые нужны проекту: {', '.join(roles) if roles else '(не указаны)'}\n\n"
+        f"О проекте (кратко): {spec_text[:1200]}\n\n"
         f"Справочник ПРОФЕССИЙ платформы:\n{json.dumps(prof_list, ensure_ascii=False)}\n\n"
         f"Справочник СТЕКОВ платформы:\n{json.dumps(stack_list, ensure_ascii=False)}\n\n"
         "Сопоставь каждую роль с профессиями и стеками платформы."

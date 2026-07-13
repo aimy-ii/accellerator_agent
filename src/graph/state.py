@@ -13,6 +13,21 @@ from langgraph.graph.message import add_messages
 from typing_extensions import TypedDict
 
 
+def first_error(current: Optional[str], incoming: Optional[str]) -> Optional[str]:
+    """Редьюсер для error: параллельные узлы могут упасть ОДНОВРЕМЕННО.
+
+    Без редьюсера LangGraph бросает InvalidUpdateError («один ключ — одно
+    значение за супершаг») и убивает весь граф. Держим первую ошибку:
+    она обычно и есть корневая.
+    """
+    return current or incoming
+
+
+def merge_flag(current: bool, incoming: bool) -> bool:
+    """Редьюсер для флагов, в которые могут писать параллельные ветки."""
+    return bool(current or incoming)
+
+
 class Context(TypedDict, total=False):
     """Параметры run'а. Передаются при каждом вызове графа.
 
@@ -68,7 +83,10 @@ class AgentState(TypedDict, total=False):
 
     # ── финал ───────────────────────────────────────────────────────────────
     finished: bool                  # все узлы пройдены — просим завести новый чат
-    error: Optional[str]
+
+    # error пишут ПАРАЛЛЕЛЬНЫЕ узлы (attach_spec ‖ match_team,
+    # create_project ‖ generate_spec) — без редьюсера граф падает.
+    error: Annotated[Optional[str], first_error]
 
 
 def new_state_defaults() -> dict[str, Any]:

@@ -145,6 +145,12 @@ async def ainvoke_llm(runnable, messages):
                     if status == 429:
                         log.error("LLM 429 после ретраев: %s", payload)
                         raise LLMOverloadedError(LLM_OVERLOADED_MESSAGE) from exc
+                    # Показываем ТЕЛО ответа провайдера — иначе 400 не отладить.
+                    log.error(
+                        "LLM ошибка status=%s: %s",
+                        status,
+                        payload[:2000],
+                    )
                     raise
 
                 elapsed = time.monotonic() - started
@@ -172,6 +178,7 @@ async def get_llm(
     temperature: float | None = None,
     *,
     fast: bool = False,
+    max_tokens: int = 8000,
 ) -> AsyncIterator[ChatOpenAI]:
     """Async-клиент OpenAI-совместимой LLM.
 
@@ -208,6 +215,7 @@ async def get_llm(
             api_key=settings.llm_api_key or "not-needed",
             model=model,
             temperature=temp,
+            max_tokens=max_tokens,
             streaming=False,
             disable_streaming=True,
             http_async_client=http_client,

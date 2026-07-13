@@ -122,7 +122,8 @@ async def match_team(
             progress(text)
 
     say("Разбираю, какие специалисты нужны проекту…")
-    role_queries = await map_roles_to_filters(roles, spec_text, api)
+    # В маппинг идёт краткая выжимка, а не полное ТЗ: роли уже известны.
+    role_queries = await map_roles_to_filters(roles, spec_summary or spec_text, api)
 
     if not role_queries.roles:
         return []

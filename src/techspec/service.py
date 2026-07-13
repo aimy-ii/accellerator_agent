@@ -40,7 +40,7 @@ async def generate_spec(
 
     log.info("Генерация ТЗ: режим=%s", "creative" if creative else "strict")
 
-    async with get_llm(temperature=0.4 if creative else 0.1) as llm:
+    async with get_llm(temperature=0.4 if creative else 0.1, max_tokens=16000) as llm:
         structured = llm.with_structured_output(TechSpec)
         result: TechSpec = await ainvoke_llm(
             structured,
@@ -67,7 +67,7 @@ async def refine_spec(current_spec: str, messages: list[dict]) -> RefinedSpec:
     """Точечно правит существующее ТЗ по замечаниям из диалога."""
     log.info("Правка ТЗ: длина исходного=%d символов", len(current_spec))
 
-    async with get_llm(temperature=0.1) as llm:
+    async with get_llm(temperature=0.1, max_tokens=16000) as llm:
         structured = llm.with_structured_output(RefinedSpec)
         result: RefinedSpec = await ainvoke_llm(
             structured,
