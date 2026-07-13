@@ -244,7 +244,7 @@ async def load_spec_node(state: AgentState, runtime: Runtime[Context]) -> dict:
             }
 
         data = await api.download_file(spec_file["file_url"])
-        text = extract_text(data, spec_file.get("file_name", ""))
+        text = await extract_text(data, spec_file.get("file_name", ""))
         log.info(
             "ТЗ проекта #%s поднято в контекст: %d символов из %s",
             project_id,
@@ -557,7 +557,7 @@ async def attach_spec_node(state: AgentState, runtime: Runtime[Context]) -> dict
         file_name = spec_file_name(title, version=version)
 
         # Бэкенд принимает docx, а не markdown — конвертируем (pandoc).
-        content = markdown_to_docx(spec_text)
+        content = await markdown_to_docx(spec_text)
 
         updated = await api.attach_file_to_project(
             int(project_id),

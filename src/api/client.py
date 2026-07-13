@@ -21,6 +21,7 @@
 """
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import logging
 from pathlib import Path
@@ -291,7 +292,8 @@ class AcceleratorAPI:
         cache_dir.mkdir(parents=True, exist_ok=True)
         cached = cache_dir / hashlib.sha256(url.encode()).hexdigest()
         if cached.exists():
-            return cached.read_bytes()
+            # Чтение с диска синхронное — в поток, чтобы не блокировать loop.
+            return await asyncio.to_thread(cached.read_bytes)
 
         try:
             async with httpx.AsyncClient(
@@ -322,7 +324,7 @@ class AcceleratorAPI:
         except httpx.RequestError as exc:
             raise DocumentDownloadError(f"Сетевая ошибка при скачивании {url}: {exc}") from exc
 
-        cached.write_bytes(data)
+        await asyncio.to_thread(cached.write_bytes, data)
         return data
 
 

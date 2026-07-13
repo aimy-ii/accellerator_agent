@@ -6,9 +6,15 @@ markdown он отклоняет. Поэтому ТЗ уходит в проек
 Конвертация — через pandoc (pypandoc-binary: бинарь в колесе, ставить в систему
 ничего не надо). Никакого ручного разбора markdown: pandoc сам делает заголовки
 стилями Word, списки — списками, таблицы — настоящими таблицами Word.
+
+ВАЖНО: pandoc синхронный и трогает файловую систему (os.getcwd, временные файлы).
+Вызывать его напрямую из async-узла нельзя — LangGraph блокирует такое как
+"Blocking call to os.getcwd" (синхронный вызов в event loop тормозит весь сервер).
+Поэтому конвертация уходит в отдельный поток через asyncio.to_thread.
 """
 from __future__ import annotations
 
+import asyncio
 import logging
 import tempfile
 from pathlib import Path
@@ -18,8 +24,8 @@ log = logging.getLogger(__name__)
 DOCX_MIME = "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
 
 
-def markdown_to_docx(markdown: str) -> bytes:
-    """Конвертирует markdown-текст ТЗ в .docx и возвращает байты файла."""
+def _convert(markdown: str) -> bytes:
+    """Синхронная конвертация. Вызывать ТОЛЬКО в отдельном потоке."""
     import pypandoc
 
     with tempfile.TemporaryDirectory() as tmp:
@@ -31,7 +37,14 @@ def markdown_to_docx(markdown: str) -> bytes:
             outputfile=str(out),
             extra_args=["--standalone"],
         )
-        data = out.read_bytes()
+        return out.read_bytes()
 
+
+async def markdown_to_docx(markdown: str) -> bytes:
+    """Конвертирует markdown-текст ТЗ в .docx.
+
+    Синхронный pandoc выносится в поток — event loop не блокируется.
+    """
+    data = await asyncio.to_thread(_convert, markdown)
     log.info("ТЗ сконвертировано в docx: %d байт", len(data))
     return data

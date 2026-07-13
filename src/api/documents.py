@@ -5,6 +5,7 @@
 """
 from __future__ import annotations
 
+import asyncio
 import io
 import logging
 
@@ -22,8 +23,17 @@ def _is_docx(data: bytes) -> bool:
     return data[:2] == b"PK"
 
 
-def extract_text(data: bytes, file_name: str = "") -> str:
-    """Возвращает текст документа. Формат определяется по сигнатуре и расширению."""
+async def extract_text(data: bytes, file_name: str = "") -> str:
+    """Возвращает текст документа.
+
+    pdfplumber и python-docx синхронные и тяжёлые — уходят в поток, чтобы не
+    блокировать event loop (LangGraph такое отлавливает и роняет узел).
+    """
+    return await asyncio.to_thread(_extract_sync, data, file_name)
+
+
+def _extract_sync(data: bytes, file_name: str = "") -> str:
+    """Синхронное извлечение. Вызывать ТОЛЬКО в потоке."""
     name = (file_name or "").lower()
 
     if _is_pdf(data):

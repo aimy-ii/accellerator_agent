@@ -116,8 +116,13 @@ async def _download(url: str) -> bytes:
 
 # ─── local (python-pptx) ────────────────────────────────────────────────────
 
-def _render_pptx(deck: Deck) -> bytes:
-    """Собирает .pptx локально из структуры слайдов."""
+async def _render_pptx(deck: Deck) -> bytes:
+    """Собирает .pptx локально. python-pptx синхронный — уходит в поток."""
+    return await asyncio.to_thread(_render_pptx_sync, deck)
+
+
+def _render_pptx_sync(deck: Deck) -> bytes:
+    """Синхронная сборка .pptx. Вызывать ТОЛЬКО в потоке."""
     from pptx import Presentation
     from pptx.util import Pt
 
@@ -182,7 +187,7 @@ async def build_presentation(
             # Ссылка временная — качаем немедленно, пока жива.
             content = await _download(export_url)
         else:
-            content = _render_pptx(deck)
+            content = await _render_pptx(deck)
             preview_url = None
 
         await api.attach_file_to_project(
