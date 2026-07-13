@@ -1,13 +1,17 @@
 """Подбор команды под проект.
 
 Поток (без векторной базы — всё через реальные ручки API):
-    роли из ТЗ
-      → LLM мапит роли на profession_ids / stack_ids платформы (справочники)
-      → GET /public/interns/v2 по фильтрам (ANY по стекам)
-      → LLM ранжирует полученный пул и объясняет выбор
-      → результат кладётся в state графа (в БД пока НЕ пишем)
+    роли из ТЗ (roles_needed)
+      → на КАЖДУЮ роль ПАРАЛЛЕЛЬНО:
+          LLM: роль → profession_ids / stack_ids платформы (плоская схема)
+          GET /public/interns/v2 по фильтрам (тянем ровно count + 1)
+          LLM: ранжировать пул, объяснить выбор
+      → результат в state графа (в БД пока НЕ пишем)
 
 «Подобрать ещё» = повторный вызов с exclude_ids (id уже показанных).
+
+Схемы ответов ПЛОСКИЕ: вложенные модели дают "$defs"/"$ref" в JSON Schema,
+а провайдер отклоняет такое с 400.
 """
 from __future__ import annotations
 
@@ -19,65 +23,75 @@ from langchain_core.messages import HumanMessage, SystemMessage
 
 from src.api.client import AcceleratorAPI
 from src.core.config import settings
-from src.team.models import RankedTeam, RoleQueries
+from src.team.directory import Directory
+from src.team.models import RankedTeam, RoleFilter
 from src.team.prompts import (
-    MAP_ROLES_SYSTEM,
     RANK_SYSTEM,
-    map_roles_user_message,
+    ROLE_FILTER_SYSTEM,
     rank_user_message,
+    role_filter_user_message,
 )
 from src.utils.llm_gen import ainvoke_llm, get_llm
 
 log = logging.getLogger(__name__)
 
 
-async def map_roles_to_filters(
-    roles: list[str],
-    spec_text: str,
-    api: AcceleratorAPI,
-) -> RoleQueries:
-    """Переводит роли из ТЗ в фильтры по справочникам платформы."""
-    professions = await api.list_professions()
-    stacks = await api.list_stacks()
+async def role_to_filter(
+    role: str,
+    summary: str,
+    professions: list[dict],
+    stacks: list[dict],
+) -> tuple[list[int], list[int], int]:
+    """Переводит ОДНУ роль в фильтр по справочникам платформы.
 
-    log.info(
-        "Справочники платформы: профессий=%d, стеков=%d",
-        len(professions),
-        len(stacks),
-    )
+    Модель возвращает НАЗВАНИЯ профессий/технологий, а id подставляет код
+    (см. directory.py). Числа на большом справочнике модель путает — названия нет.
+
+    Returns:
+        (profession_ids, stack_ids, count)
+    """
+    prof_dir = Directory(professions, "Профессии")
+    stack_dir = Directory(stacks, "Технологии")
 
     async with get_llm(temperature=0.0, fast=True) as llm:
-        structured = llm.with_structured_output(RoleQueries)
-        result: RoleQueries = await ainvoke_llm(
+        structured = llm.with_structured_output(RoleFilter)
+        result: RoleFilter = await ainvoke_llm(
             structured,
             [
-                SystemMessage(content=MAP_ROLES_SYSTEM),
+                SystemMessage(content=ROLE_FILTER_SYSTEM),
                 HumanMessage(
-                    content=map_roles_user_message(roles, professions, stacks, spec_text)
+                    content=role_filter_user_message(role, summary, professions, stacks)
                 ),
             ],
         )
 
-    known_professions = {p["id"] for p in professions}
-    known_stacks = {s["id"] for s in stacks}
-    for role in result.roles:
-        role.profession_ids = [i for i in role.profession_ids if i in known_professions]
-        role.stack_ids = [i for i in role.stack_ids if i in known_stacks]
+    profession_ids, _ = prof_dir.resolve(result.professions)
+    stack_ids, _ = stack_dir.resolve(result.stacks)
+    count = max(1, result.count)
 
-    log.info("Роли сопоставлены: %d", len(result.roles))
-    return result
+    log.info(
+        "Роль '%s' → %s | %s",
+        role,
+        prof_dir.names_of(profession_ids) or "профессий не найдено",
+        (result.reasoning or "—")[:150],
+    )
+    return profession_ids, stack_ids, count
 
 
 async def rank_candidates(
     role: str,
-    spec_summary: str,
+    summary: str,
     candidates: list[dict],
     *,
     top_n: int,
-) -> RankedTeam:
-    """Ранжирует уже отфильтрованный пул кандидатов под роль."""
+) -> list[tuple[int, str, int]]:
+    """Ранжирует пул кандидатов под роль.
+
+    Returns:
+        [(intern_id, match_reason, score), ...] — от лучшего к худшему.
+    """
     if not candidates:
-        return RankedTeam(candidates=[])
+        return []
 
     async with get_llm(temperature=0.2, fast=True) as llm:
         structured = llm.with_structured_output(RankedTeam)
@@ -86,14 +100,13 @@ async def rank_candidates(
             [
                 SystemMessage(content=RANK_SYSTEM),
                 HumanMessage(
-                    content=rank_user_message(role, spec_summary, candidates, top_n)
+                    content=rank_user_message(role, summary, candidates, top_n)
                 ),
             ],
         )
 
-    valid_ids = {int(c.get("id", 0)) for c in candidates}
-    result.candidates = [c for c in result.candidates if c.intern_id in valid_ids][:top_n]
-    return result
+    valid = {int(c["id"]) for c in candidates}
+    return [p for p in result.pairs() if p[0] in valid][:top_n]
 
 
 async def match_team(
@@ -107,8 +120,8 @@ async def match_team(
 ) -> list[dict]:
     """Подбирает команду под проект. Все роли — ПАРАЛЛЕЛЬНО.
 
-    На роль отдаём count + 1 кандидата (count берётся из ТЗ; нет — считаем 1),
-    чтобы у заказчика был выбор, но без лишнего перебора.
+    На роль отдаём count + 1 кандидата (count из ТЗ; нет — 1), чтобы у заказчика
+    был выбор, но без лишнего перебора.
 
     Args:
         exclude_ids: кого не показывать (уже в подборке) — для «подобрать ещё».
@@ -121,69 +134,116 @@ async def match_team(
         if progress:
             progress(text)
 
-    say("Разбираю, какие специалисты нужны проекту…")
-    # В маппинг идёт краткая выжимка, а не полное ТЗ: роли уже известны.
-    role_queries = await map_roles_to_filters(roles, spec_summary or spec_text, api)
-
-    if not role_queries.roles:
+    if not roles:
+        log.warning("Роли не переданы — подбирать не под кого")
         return []
 
+    say("Смотрю, какие специалисты есть на платформе…")
+    professions = await api.list_professions()
+    stacks = await api.list_stacks()
+    log.info("Справочники: профессий=%d, стеков=%d", len(professions), len(stacks))
+
+    summary = spec_summary or spec_text[:1200]
     exclude = list(exclude_ids or [])
 
-    async def _one_role(rq) -> dict:
-        """Полный цикл по одной роли: выборка → ранжирование."""
-        want = rq.count + 1  # count из ТЗ + 1 запасной, чтобы было из чего выбрать
-        say(f"Ищу: {rq.role}…")
+    async def _one_role(role: str) -> dict:
+        """Полный цикл по одной роли: фильтр → выборка → ранжирование."""
+        try:
+            profession_ids, stack_ids, count = await role_to_filter(
+                role, summary, professions, stacks
+            )
+        except Exception as exc:  # noqa: BLE001
+            log.error("Роль '%s': не удалось сопоставить со справочниками: %s", role, exc)
+            return {
+                "role": role,
+                "profession_ids": [],
+                "count": 1,
+                "candidates": [],
+                "note": "Не удалось подобрать фильтры под эту роль",
+            }
+
+        want = count + 1  # count из ТЗ + 1 запасной
+        say(f"Ищу: {role}…")
+
+        # Профессии под роль нет вообще — на платформе таких людей не бывает.
+        # Так и говорим, не подсовывая случайных.
+        if not profession_ids:
+            log.info("Роль '%s': профессии нет в справочнике платформы", role)
+            return {
+                "role": role,
+                "profession_ids": [],
+                "count": count,
+                "candidates": [],
+                "note": "Такой профессии на платформе нет — специалиста нужно искать вне её",
+            }
 
         pool = await api.search_interns(
-            profession_ids=rq.profession_ids or None,
-            stack_ids=rq.stack_ids or None,
+            profession_ids=profession_ids,
+            stack_ids=stack_ids or None,
             exclude_ids=exclude,
             per_page=want,
         )
-        log.info("Роль '%s': нужно %d, нашлось %d", rq.role, want, len(pool))
+
+        # Стеки — это «хотелось бы», профессия — «обязательно». Если связка
+        # профессия+стек не дала никого, ищем по одной профессии: лучше показать
+        # спеца без нужного стека, чем не показать никого.
+        if not pool and stack_ids:
+            log.info("Роль '%s': по технологиям пусто — повторяю только по профессии", role)
+            say(f"{role}: расширяю поиск…")
+            pool = await api.search_interns(
+                profession_ids=profession_ids,
+                exclude_ids=exclude,
+                per_page=want,
+            )
+
+        log.info("Роль '%s': нужно %d, нашлось %d", role, want, len(pool))
 
         if not pool:
             return {
-                "role": rq.role,
-                "profession_ids": rq.profession_ids,
-                "count": rq.count,
+                "role": role,
+                "profession_ids": profession_ids,
+                "count": count,
                 "candidates": [],
-                "note": "На платформе пока нет подходящих специалистов",
+                "note": "Специалисты этой профессии на платформе есть, но сейчас свободных нет",
             }
 
-        ranked = await rank_candidates(rq.role, spec_summary, pool, top_n=want)
-        by_id = {int(c["id"]): c for c in pool}
+        try:
+            ranked = await rank_candidates(role, summary, pool, top_n=want)
+        except Exception as exc:  # noqa: BLE001
+            # Ранжирование упало — отдаём пул как есть, без объяснений.
+            log.error("Роль '%s': ранжирование не удалось: %s", role, exc)
+            ranked = [(int(c["id"]), "", 50) for c in pool[:want]]
 
+        by_id = {int(c["id"]): c for c in pool}
         candidates: list[dict] = []
-        for rc in ranked.candidates:
-            profile = by_id.get(rc.intern_id)
+        for intern_id, reason, score in ranked:
+            profile = by_id.get(intern_id)
             if not profile:
                 continue
             name = " ".join(
                 filter(None, [profile.get("first_name"), profile.get("last_name")])
-            ).strip() or f"Специалист #{rc.intern_id}"
+            ).strip() or f"Специалист #{intern_id}"
             candidates.append(
                 {
-                    "intern_id": rc.intern_id,
+                    "intern_id": intern_id,
                     "name": name,
                     "profession": (profile.get("profession") or {}).get("name"),
-                    "match_reason": rc.match_reason,
-                    "score": rc.score,
+                    "match_reason": reason,
+                    "score": score,
                     "profile": profile,
                 }
             )
 
-        say(f"{rq.role}: подобрано {len(candidates)}")
+        say(f"{role}: подобрано {len(candidates)}")
         return {
-            "role": rq.role,
-            "profession_ids": rq.profession_ids,
-            "count": rq.count,
+            "role": role,
+            "profession_ids": profession_ids,
+            "count": count,
             "candidates": candidates,
         }
 
     # Все роли разом — не в очереди.
-    return list(await asyncio.gather(*[_one_role(rq) for rq in role_queries.roles]))
+    return list(await asyncio.gather(*[_one_role(r) for r in roles]))
 
 
 def collect_candidate_ids(team: list[dict]) -> list[int]:

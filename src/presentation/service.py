@@ -39,7 +39,7 @@ async def generate_deck(spec_text: str, roles: list[str]) -> Deck:
                 HumanMessage(content=deck_user_message(spec_text, roles)),
             ],
         )
-    log.info("Структура презентации: слайдов=%d", len(deck.slides))
+    log.info("Структура презентации: слайдов=%d", len(deck.slide_titles))
     return deck
 
 
@@ -50,9 +50,9 @@ def _deck_to_markdown(deck: Deck) -> str:
     blocks = [f"# {deck.title}"]
     if deck.subtitle:
         blocks[0] += f"\n\n{deck.subtitle}"
-    for slide in deck.slides:
-        lines = [f"## {slide.title}"]
-        lines.extend(f"- {b}" for b in slide.bullets)
+    for title, bullets in deck.slides():
+        lines = [f"## {title}"]
+        lines.extend(f"- {b}" for b in bullets)
         blocks.append("\n".join(lines))
     return "\n\n---\n\n".join(blocks)
 
@@ -135,17 +135,15 @@ def _render_pptx_sync(deck: Deck) -> bytes:
         first.placeholders[1].text = deck.subtitle
 
     bullet_layout = prs.slide_layouts[1]
-    for slide in deck.slides:
+    for title, bullets in deck.slides():
         s = prs.slides.add_slide(bullet_layout)
-        s.shapes.title.text = slide.title
+        s.shapes.title.text = title
         body = s.placeholders[1].text_frame
         body.clear()
-        for i, bullet in enumerate(slide.bullets):
+        for i, bullet in enumerate(bullets):
             para = body.paragraphs[0] if i == 0 else body.add_paragraph()
             para.text = bullet
             para.font.size = Pt(18)
-        if slide.notes:
-            s.notes_slide.notes_text_frame.text = slide.notes
 
     buffer = io.BytesIO()
     prs.save(buffer)

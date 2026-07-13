@@ -625,11 +625,13 @@ async def present_team_node(state: AgentState, runtime: Runtime[Context]) -> dic
     lines = [f"Подобрал специалистов под проект — всего {total}."]
     for block in team:
         names = ", ".join(c["name"] for c in block.get("candidates", []))
-        lines.append(
-            f"— {block['role']}: {names}"
-            if names
-            else f"— {block['role']}: подходящих на платформе пока нет"
-        )
+        if names:
+            lines.append(f"— {block['role']}: {names}")
+        else:
+            # Причина у каждой роли своя: профессии нет на платформе / есть,
+            # но никто не подошёл / фильтр не собрался.
+            note = block.get("note") or "подходящих не нашлось"
+            lines.append(f"— {block['role']}: {note.lower()}")
     lines.append(
         "\nМогу подобрать ещё кандидатов на эти же роли — тех, кто уже в списке, "
         "повторять не буду."
