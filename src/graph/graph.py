@@ -18,6 +18,8 @@
                                                   │
                                           present_team ──(подобрать ещё)──► match_team
                                                   │ (достаточно)
+                                          save_candidates (POST в проект)
+                                                  ▼
                                           presentation → finalize → __end__
 
 Ключевое:
@@ -51,6 +53,7 @@ from src.graph.nodes import (
     present_team_node,
     presentation_node,
     refine_spec_node,
+    save_candidates_node,
     select_project_node,
 )
 from src.graph.state import AgentState, Context
@@ -156,11 +159,16 @@ def _after_match(state: AgentState) -> Literal["present_team", "finalize"]:
 
 def _after_present_team(
     state: AgentState,
-) -> Literal["match_team", "presentation", "finalize"]:
-    """«Подобрать ещё» → назад в match_team (exclude отсечёт уже показанных)."""
+) -> Literal["match_team", "save_candidates", "finalize"]:
+    """«Подобрать ещё» → назад в match_team. «Достаточно» → записать подборку в БД."""
     if state.get("error"):
         return "finalize"
-    return "match_team" if state.get("wants_more_candidates") else "presentation"
+    return "match_team" if state.get("wants_more_candidates") else "save_candidates"
+
+
+def _after_save_candidates(state: AgentState) -> Literal["presentation", "finalize"]:
+    """Подборка записана — дальше презентация (или сразу финал, если она off)."""
+    return "finalize" if state.get("error") else "presentation"
 
 
 builder = (
@@ -178,6 +186,7 @@ builder = (
     .add_node("attach_spec", attach_spec_node)
     .add_node("match_team", match_team_node)
     .add_node("present_team", present_team_node)
+    .add_node("save_candidates", save_candidates_node)
     .add_node("presentation", presentation_node)
     .add_node("finalize", finalize_node)
     # ─── рёбра: у каждого условного перехода явная карта назначений ─────────
@@ -219,7 +228,10 @@ builder = (
     .add_conditional_edges(
         "present_team",
         _after_present_team,
-        ["match_team", "presentation", "finalize"],
+        ["match_team", "save_candidates", "finalize"],
+    )
+    .add_conditional_edges(
+        "save_candidates", _after_save_candidates, ["presentation", "finalize"]
     )
     .add_edge("presentation", "finalize")
     .add_edge("finalize", "__end__")

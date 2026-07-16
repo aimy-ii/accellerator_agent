@@ -54,39 +54,3 @@ class RoleFilter(BaseModel):
         default=1,
         description="Сколько таких специалистов нужно проекту. Не сказано — 1",
     )
-
-
-class RankedTeam(BaseModel):
-    """Отранжированные кандидаты под роль — тремя ПАРАЛЛЕЛЬНЫМИ списками.
-
-    Плоская вместо list[RankedCandidate]: i-й элемент каждого списка относится
-    к одному кандидату.
-
-    Здесь id уместны: это идентификаторы из ТОЛЬКО ЧТО переданного короткого
-    списка кандидатов (единицы штук), а не выбор из большого справочника.
-    """
-
-    intern_ids: list[int] = Field(
-        default_factory=list,
-        description="ID специалистов из переданного списка, от лучшего к худшему",
-    )
-    match_reasons: list[str] = Field(
-        default_factory=list,
-        description=(
-            "Почему подходит — по предложению на каждого, в ТОМ ЖЕ порядке, "
-            "что и intern_ids. Человеческим языком, без жаргона"
-        ),
-    )
-    scores: list[int] = Field(
-        default_factory=list,
-        description="Оценка соответствия 1-100, в ТОМ ЖЕ порядке, что и intern_ids",
-    )
-
-    def pairs(self) -> list[tuple[int, str, int]]:
-        """Сшивает параллельные списки обратно в кандидатов."""
-        out: list[tuple[int, str, int]] = []
-        for i, intern_id in enumerate(self.intern_ids):
-            reason = self.match_reasons[i] if i < len(self.match_reasons) else ""
-            score = self.scores[i] if i < len(self.scores) else 50
-            out.append((intern_id, reason, score))
-        return out

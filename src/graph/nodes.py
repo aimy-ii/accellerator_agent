@@ -659,6 +659,61 @@ async def present_team_node(state: AgentState, runtime: Runtime[Context]) -> dic
     return {"wants_more_candidates": False, "messages": turn}
 
 
+# ─── 6.5. запись подборки в проект ──────────────────────────────────────────
+
+async def save_candidates_node(state: AgentState, runtime: Runtime[Context]) -> dict:
+    """Пишет подобранную команду в проект (POST /candidates, статус POTENTIAL).
+
+    Идёт после того, как заказчик подтвердил подборку («достаточно»). До этого
+    команда жила только в стейте графа — здесь она попадает в БД проекта и
+    становится видна в кабинете заказчика (вкладка приглашений).
+    """
+    if _skip_on_error(state):
+        return {}
+
+    project_id = state.get("target_project_id")
+    intern_ids = collect_candidate_ids(state.get("team") or [])
+
+    if not project_id or not intern_ids:
+        # Нечего или некуда сохранять (никого не подобрали) — не ошибка, идём дальше.
+        return {}
+
+    try:
+        emit("save_candidates", "Сохраняю подобранную команду в проект…")
+        api = _api(runtime)
+        result = await api.add_candidates(int(project_id), intern_ids)
+
+        created = result.get("created", [])
+        skipped = result.get("skipped", [])
+        log.info(
+            "Подборка записана в проект #%s: создано=%d, пропущено=%d",
+            project_id,
+            len(created),
+            len(skipped),
+        )
+        if skipped:
+            log.info("Пропущены при записи: %s", skipped)
+
+        return {
+            "messages": [
+                AIMessage(
+                    content=f"Сохранил подобранную команду в проект — {len(created)} чел."
+                )
+            ]
+        }
+    except Exception as exc:  # noqa: BLE001
+        # Подборка уже показана заказчику; не рушим весь прогон из-за записи.
+        log.error("Не удалось записать подборку в проект #%s: %s", project_id, exc)
+        return {
+            "messages": [
+                AIMessage(
+                    content="Подборку показал, но сохранить в проект не удалось — "
+                    "попробуйте позже."
+                )
+            ]
+        }
+
+
 # ─── 7. презентация (бизнес-логика; включается флагом) ──────────────────────
 
 async def presentation_node(state: AgentState, runtime: Runtime[Context]) -> dict:

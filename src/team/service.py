@@ -24,13 +24,8 @@ from langchain_core.messages import HumanMessage, SystemMessage
 from src.api.client import AcceleratorAPI
 from src.core.config import settings
 from src.team.directory import Directory
-from src.team.models import RankedTeam, RoleFilter
-from src.team.prompts import (
-    RANK_SYSTEM,
-    ROLE_FILTER_SYSTEM,
-    rank_user_message,
-    role_filter_user_message,
-)
+from src.team.models import RoleFilter
+from src.team.prompts import ROLE_FILTER_SYSTEM, role_filter_user_message
 from src.utils.llm_gen import ainvoke_llm, get_llm
 
 log = logging.getLogger(__name__)
@@ -76,37 +71,6 @@ async def role_to_filter(
         (result.reasoning or "—")[:150],
     )
     return profession_ids, stack_ids, count
-
-
-async def rank_candidates(
-    role: str,
-    summary: str,
-    candidates: list[dict],
-    *,
-    top_n: int,
-) -> list[tuple[int, str, int]]:
-    """Ранжирует пул кандидатов под роль.
-
-    Returns:
-        [(intern_id, match_reason, score), ...] — от лучшего к худшему.
-    """
-    if not candidates:
-        return []
-
-    async with get_llm(temperature=0.2, fast=True) as llm:
-        structured = llm.with_structured_output(RankedTeam)
-        result: RankedTeam = await ainvoke_llm(
-            structured,
-            [
-                SystemMessage(content=RANK_SYSTEM),
-                HumanMessage(
-                    content=rank_user_message(role, summary, candidates, top_n)
-                ),
-            ],
-        )
-
-    valid = {int(c["id"]) for c in candidates}
-    return [p for p in result.pairs() if p[0] in valid][:top_n]
 
 
 async def match_team(
@@ -207,19 +171,10 @@ async def match_team(
                 "note": "Специалисты этой профессии на платформе есть, но сейчас свободных нет",
             }
 
-        try:
-            ranked = await rank_candidates(role, summary, pool, top_n=want)
-        except Exception as exc:  # noqa: BLE001
-            # Ранжирование упало — отдаём пул как есть, без объяснений.
-            log.error("Роль '%s': ранжирование не удалось: %s", role, exc)
-            ranked = [(int(c["id"]), "", 50) for c in pool[:want]]
-
-        by_id = {int(c["id"]): c for c in pool}
+        # Берём первых count+1 из выдачи API как есть — без LLM-ранжирования.
         candidates: list[dict] = []
-        for intern_id, reason, score in ranked:
-            profile = by_id.get(intern_id)
-            if not profile:
-                continue
+        for profile in pool[:want]:
+            intern_id = int(profile["id"])
             name = " ".join(
                 filter(None, [profile.get("first_name"), profile.get("last_name")])
             ).strip() or f"Специалист #{intern_id}"
@@ -228,8 +183,6 @@ async def match_team(
                     "intern_id": intern_id,
                     "name": name,
                     "profession": (profile.get("profession") or {}).get("name"),
-                    "match_reason": reason,
-                    "score": score,
                     "profile": profile,
                 }
             )

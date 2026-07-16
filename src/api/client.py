@@ -270,6 +270,26 @@ class AcceleratorAPI:
         """GET /api/public/interns/{intern_id} — полный профиль специалиста."""
         return await self._request("GET", f"/public/interns/{intern_id}")
 
+    async def add_candidates(self, project_id: int, intern_ids: list[int]) -> dict:
+        """POST /api/projects/{id}/candidates — записать подборку пачкой (POTENTIAL).
+
+        Специалисты попадают в проект как «наброски» (им пока НЕ видны), заказчик
+        потом приглашает их отдельно. Ручка идемпотентна и не падает из-за одного
+        плохого id — создаёт всех, кого может.
+
+        Args:
+            intern_ids: id специалистов, 1..50. Дубли бэкенд убирает сам.
+
+        Returns:
+            {"created": [id, ...], "skipped": [{"intern_id", "reason", "message"}, ...]}
+            reason: not_found | already_responded | already_invited.
+        """
+        return await self._request(
+            "POST",
+            f"/projects/{project_id}/candidates",
+            json={"intern_ids": intern_ids},
+        )
+
     async def list_professions(self) -> list[dict]:
         """GET /api/public/professions — справочник профессий."""
         return await self._request("GET", "/public/professions") or []
