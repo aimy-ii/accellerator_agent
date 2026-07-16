@@ -12,7 +12,7 @@ from src.requirements_flow.prompts import (
     assess_user_message,
     questions_user_message,
 )
-from src.utils.llm_gen import ainvoke_llm, get_llm
+from src.utils.llm_gen import ainvoke_llm, astream_structured, get_llm
 
 log = logging.getLogger(__name__)
 
@@ -21,11 +21,17 @@ async def next_questions(
     messages: list[dict],
     *,
     spec_context: str | None = None,
+    on_delta=None,
 ) -> QuestionBatch:
-    """Возвращает готовую реплику с вопросами (или has_questions=False)."""
+    """Возвращает готовую реплику с вопросами (или has_questions=False).
+
+    Args:
+        on_delta: колбэк дельт поля message (потокенная печать);
+            если задан — astream_structured, иначе ainvoke_llm.
+    """
     async with get_llm(temperature=0.3, fast=True) as llm:
         structured = llm.with_structured_output(QuestionBatch)
-        result: QuestionBatch = await ainvoke_llm(
+        result: QuestionBatch = await astream_structured(
             structured,
             [
                 SystemMessage(content=QUESTIONS_SYSTEM),
@@ -33,6 +39,8 @@ async def next_questions(
                     content=questions_user_message(messages, spec_context=spec_context)
                 ),
             ],
+            on_text_delta=on_delta,
+            text_field="message",
         )
     log.info(
         "Вопросы: has_questions=%s coverage=%s can_generate=%s",

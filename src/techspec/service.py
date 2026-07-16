@@ -17,7 +17,7 @@ from src.techspec.prompts import (
     generate_user_message,
     refine_user_message,
 )
-from src.utils.llm_gen import ainvoke_llm, get_llm
+from src.utils.llm_gen import ainvoke_llm, astream_structured, get_llm
 
 log = logging.getLogger(__name__)
 
@@ -27,6 +27,7 @@ async def generate_spec(
     *,
     creative: bool,
     missing_topics: list[str] | None = None,
+    on_delta=None,
 ) -> TechSpec:
     """Генерирует ТЗ с нуля.
 
@@ -35,6 +36,8 @@ async def generate_spec(
             всё придуманное в assumptions). False — данных много, ИИ почти
             ничего не придумывает и оформляет сказанное.
         missing_topics: нераскрытые темы — подсказка креативному режиму.
+        on_delta: колбэк дельт поля tech_spec_text (потокенная печать);
+            если задан — astream_structured, иначе ainvoke_llm.
     """
     system = CREATIVE_SYSTEM if creative else STRICT_SYSTEM
     hint = ", ".join(missing_topics or []) if creative else None
@@ -43,7 +46,7 @@ async def generate_spec(
 
     async with get_llm(temperature=0.4 if creative else 0.1, max_tokens=16000) as llm:
         structured = llm.with_structured_output(TechSpec)
-        result: TechSpec = await ainvoke_llm(
+        result: TechSpec = await astream_structured(
             structured,
             [
                 SystemMessage(content=system),
@@ -54,6 +57,8 @@ async def generate_spec(
                     )
                 ),
             ],
+            on_text_delta=on_delta,
+            text_field="tech_spec_text",
         )
     log.info(
         "ТЗ готово: %s, допущений=%d, ролей=%d",
@@ -69,18 +74,21 @@ async def refine_spec(
     messages: list[dict],
     *,
     current_title: str = "",
+    on_delta=None,
 ) -> RefinedSpec:
     """Точечно правит существующее ТЗ по замечаниям из диалога.
 
     Args:
         current_title: текущее название проекта — модель решит, не устарело ли оно
             после правок (см. RefinedSpec.proposed_title).
+        on_delta: колбэк дельт поля tech_spec_text (потокенная печать);
+            если задан — astream_structured, иначе ainvoke_llm.
     """
     log.info("Правка ТЗ: длина исходного=%d символов", len(current_spec))
 
     async with get_llm(temperature=0.1, max_tokens=16000) as llm:
         structured = llm.with_structured_output(RefinedSpec)
-        result: RefinedSpec = await ainvoke_llm(
+        result: RefinedSpec = await astream_structured(
             structured,
             [
                 SystemMessage(content=REFINE_SYSTEM),
@@ -90,6 +98,8 @@ async def refine_spec(
                     )
                 ),
             ],
+            on_text_delta=on_delta,
+            text_field="tech_spec_text",
         )
     log.info(
         "ТЗ обновлено: изменений=%d, роли изменились=%s, новое название=%s",
