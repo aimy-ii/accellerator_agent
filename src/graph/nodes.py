@@ -39,7 +39,7 @@ from src.graph.interrupts import (
     render_choices,
     resolve,
 )
-from src.graph.progress import emit, progress_for
+from src.graph.progress import emit, emit_token, progress_for
 from src.graph.state import AgentState, Context
 from src.presentation.service import build_presentation
 from src.requirements_flow.service import next_questions
@@ -165,7 +165,7 @@ async def load_projects_node(state: AgentState, runtime: Runtime[Context]) -> di
     if state.get("projects"):
         return {}
     try:
-        emit("load_projects", "Смотрю ваши проекты…")
+        emit("load_projects", "Смотрю ваши проекты…", "start")
         api = _api(runtime)
         projects = await api.get_my_projects_flat()
         emit("load_projects", f"Нашёл проектов: {len(projects)}")
@@ -236,7 +236,7 @@ async def load_spec_node(state: AgentState, runtime: Runtime[Context]) -> dict:
 
     project_id = state.get("target_project_id")
     try:
-        emit("load_spec", "Поднимаю техническое задание проекта…")
+        emit("load_spec", "Поднимаю техническое задание проекта…", "start")
         api = _api(runtime)
         project = await api.get_project(int(project_id))
         if not project:
@@ -245,6 +245,7 @@ async def load_spec_node(state: AgentState, runtime: Runtime[Context]) -> dict:
         spec_file = pick_spec_file(project.get("files") or [])
         if not spec_file:
             log.info("У проекта #%s нет файла ТЗ — работаем от описания", project_id)
+            emit("load_spec", "Техническое задание поднято", "done")
             return {
                 "existing_spec_text": (project.get("description") or "").strip(),
                 "spec_title": project.get("title"),
@@ -260,6 +261,7 @@ async def load_spec_node(state: AgentState, runtime: Runtime[Context]) -> dict:
             len(text),
             spec_file.get("file_name"),
         )
+        emit("load_spec", "Техническое задание поднято", "done")
         return {
             "existing_spec_text": text,
             "existing_spec_file": spec_file,
@@ -406,10 +408,11 @@ async def ask_questions_node(state: AgentState, runtime: Runtime[Context]) -> di
         return {}
 
     try:
-        emit("ask_questions", "Думаю, что уточнить…")
+        emit("ask_questions", "Думаю, что уточнить…", "start")
         batch = await next_questions(
             _dialog(state),
             spec_context=state.get("existing_spec_text"),
+            on_delta=emit_token,
         )
     except LLMOverloadedError as exc:
         return {"error": str(exc)}
@@ -426,6 +429,7 @@ async def ask_questions_node(state: AgentState, runtime: Runtime[Context]) -> di
     if not batch.has_questions or not batch.message.strip():
         return {**assessment, "ready_to_generate": True}
 
+    emit("ask_questions", "Вопросы готовы", "done")
     reply = ask(Ask(kind=KIND_ASK_QUESTIONS, message=batch.message))
 
     return {
@@ -501,7 +505,7 @@ async def create_project_node(state: AgentState, runtime: Runtime[Context]) -> d
         return {}
 
     try:
-        emit("create_project", "Оформляю карточку проекта…")
+        emit("create_project", "Оформляю карточку проекта…", "start")
         card = await make_card(_dialog(state))
 
         api = _api(runtime)
@@ -548,18 +552,19 @@ async def generate_spec_node(state: AgentState, runtime: Runtime[Context]) -> di
     creative = coverage != "rich"
 
     try:
-        emit("generate_spec", "Пишу техническое задание…")
+        emit("generate_spec", "Пишу техническое задание…", "start")
         spec = await generate_spec(
             _dialog(state),
             creative=creative,
             missing_topics=state.get("missing_topics") or [],
+            on_delta=emit_token,
         )
     except LLMOverloadedError as exc:
         return {"error": str(exc)}
     except Exception as exc:  # noqa: BLE001
         return {"error": f"Не удалось составить ТЗ: {exc}"}
 
-    emit("generate_spec", "Техническое задание готово")
+    emit("generate_spec", "Техническое задание готово", "done")
     return {
         # title/summary приходят из create_project (идёт параллельно) — не перетираем
         "spec_text": spec.tech_spec_text,
@@ -580,9 +585,12 @@ async def refine_spec_node(state: AgentState, runtime: Runtime[Context]) -> dict
         return await generate_spec_node(state, runtime)
 
     try:
-        emit("refine_spec", "Вношу правки в техническое задание…")
+        emit("refine_spec", "Вношу правки в техническое задание…", "start")
         refined = await refine_spec(
-            current, _dialog(state), current_title=state.get("spec_title") or ""
+            current,
+            _dialog(state),
+            current_title=state.get("spec_title") or "",
+            on_delta=emit_token,
         )
     except LLMOverloadedError as exc:
         return {"error": str(exc)}
@@ -594,6 +602,7 @@ async def refine_spec_node(state: AgentState, runtime: Runtime[Context]) -> dict
     proposed = (refined.proposed_title or "").strip()
     proposed_title = proposed if proposed and proposed != current_title else None
 
+    emit("refine_spec", "Правки внесены", "done")
     return {
         "spec_text": refined.tech_spec_text,
         "spec_changes": refined.change_summary,
@@ -726,7 +735,7 @@ async def attach_spec_node(state: AgentState, runtime: Runtime[Context]) -> dict
     spec_text = state.get("spec_text") or ""
 
     try:
-        emit("attach_spec", "Сохраняю ТЗ в проект…")
+        emit("attach_spec", "Сохраняю ТЗ в проект…", "start")
 
         if state.get("mode") == "edit":
             patch = {"description": state.get("spec_summary") or ""}
@@ -793,6 +802,7 @@ async def match_team_node(state: AgentState, runtime: Runtime[Context]) -> dict:
         return {"error": f"Не удалось подобрать команду: {exc}"}
 
     merged = merge_team(list(state.get("team") or []), team)
+    emit("match_team", "Команда подобрана", "done")
     return {
         "team": merged,
         "candidate_ids": collect_candidate_ids(merged),
@@ -907,7 +917,7 @@ async def save_candidates_node(state: AgentState, runtime: Runtime[Context]) -> 
         return {}
 
     try:
-        emit("save_candidates", "Сохраняю подобранную команду в проект…")
+        emit("save_candidates", "Сохраняю подобранную команду в проект…", "start")
         result = await api.add_candidates(int(project_id), intern_ids)
 
         created = result.get("created", [])
@@ -921,6 +931,7 @@ async def save_candidates_node(state: AgentState, runtime: Runtime[Context]) -> 
         if skipped:
             log.info("Пропущены при записи: %s", skipped)
 
+        emit("save_candidates", "Команда сохранена в проект", "done")
         return {
             "messages": [
                 AIMessage(
@@ -955,7 +966,7 @@ async def presentation_node(state: AgentState, runtime: Runtime[Context]) -> dic
         return {}
 
     try:
-        emit("presentation", "Собираю презентацию проекта…")
+        emit("presentation", "Собираю презентацию проекта…", "start")
         api = _api(runtime)
         result = await build_presentation(
             state.get("spec_text") or "",
@@ -971,6 +982,7 @@ async def presentation_node(state: AgentState, runtime: Runtime[Context]) -> dic
     if result.error:
         return {"presentation": result.model_dump()}
 
+    emit("presentation", "Презентация готова", "done")
     return {
         "presentation": result.model_dump(),
         "messages": [AIMessage(content="Презентация проекта готова и приложена.")],

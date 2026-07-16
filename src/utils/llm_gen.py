@@ -173,6 +173,54 @@ async def ainvoke_llm(runnable, messages):
                 await asyncio.sleep(delay)
 
 
+async def astream_structured(
+    structured,
+    messages,
+    *,
+    on_text_delta=None,
+    text_field: str | None = None,
+):
+    """Стримит структурный вывод LLM, отдавая дельты поля text_field.
+
+    Ведёт себя как ainvoke_llm, но по мере генерации вызывает
+    on_text_delta(delta) с приростом текстового поля — для потокенной печати.
+    Если on_text_delta/text_field не заданы или стрим не удался — обычный
+    ainvoke_llm без дельт.
+
+    Фолбэк на ainvoke_llm выполняется вне семафора этого хелпера
+    (ainvoke_llm сам берёт _llm_semaphore — двойного удержания нет).
+
+    Returns:
+        Распарсенный объект того же типа, что вернул бы ainvoke_llm.
+    """
+    if on_text_delta is None or not text_field:
+        return await ainvoke_llm(structured, messages)
+
+    def _field(obj):
+        if obj is None:
+            return None
+        if isinstance(obj, dict):
+            return obj.get(text_field)
+        return getattr(obj, text_field, None)
+
+    try:
+        sent = 0
+        final = None
+        async with _llm_semaphore:
+            async for partial in structured.astream(messages):
+                final = partial
+                value = _field(partial)
+                if isinstance(value, str) and len(value) > sent:
+                    on_text_delta(value[sent:])
+                    sent = len(value)
+        if final is not None:
+            return final
+    except Exception as exc:  # noqa: BLE001
+        log.warning("Стрим структурного вывода не удался, фолбэк на ainvoke: %s", exc)
+
+    return await ainvoke_llm(structured, messages)
+
+
 @asynccontextmanager
 async def get_llm(
     temperature: float | None = None,
