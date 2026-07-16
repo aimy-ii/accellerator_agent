@@ -270,6 +270,39 @@ class AcceleratorAPI:
         """GET /api/public/interns/{intern_id} — полный профиль специалиста."""
         return await self._request("GET", f"/public/interns/{intern_id}")
 
+    async def add_candidates(self, project_id: int, intern_ids: list[int]) -> dict:
+        """POST /api/projects/{id}/candidates — записать подборку пачкой (POTENTIAL).
+
+        Специалисты попадают в проект как «наброски» (им пока НЕ видны), заказчик
+        потом приглашает их отдельно. Ручка идемпотентна и не падает из-за одного
+        плохого id — создаёт всех, кого может.
+
+        Args:
+            intern_ids: id специалистов, 1..50. Дубли бэкенд убирает сам.
+
+        Returns:
+            {"created": [id, ...], "skipped": [{"intern_id", "reason", "message"}, ...]}
+            reason: not_found | already_responded | already_invited.
+        """
+        return await self._request(
+            "POST",
+            f"/projects/{project_id}/candidates",
+            json={"intern_ids": intern_ids},
+        )
+
+    async def list_project_invitations(self, project_id: int) -> list[dict]:
+        """GET /api/projects/{id}/invitations — приглашения проекта (для заказчика).
+
+        Возвращает ВСЕ статусы, включая наброски:
+        `potential` (претенденты) | `invited` | `accepted` | `declined`.
+        Нужно для краткой сводки проекта при доработке.
+
+        Returns:
+            Список ProjectInvitationRead (может быть пустым).
+        """
+        data = await self._request("GET", f"/projects/{project_id}/invitations")
+        return data or []
+
     async def list_professions(self) -> list[dict]:
         """GET /api/public/professions — справочник профессий."""
         return await self._request("GET", "/public/professions") or []
@@ -289,11 +322,13 @@ class AcceleratorAPI:
         url = file_url if file_url.startswith("http") else f"{self._base}{file_url}"
 
         cache_dir = settings.doc_cache_dir_path
-        cache_dir.mkdir(parents=True, exist_ok=True)
         cached = cache_dir / hashlib.sha256(url.encode()).hexdigest()
-        if cached.exists():
-            # Чтение с диска синхронное — в поток, чтобы не блокировать loop.
-            return await asyncio.to_thread(cached.read_bytes)
+
+        # ВСЯ файловая возня (mkdir + exists + read) синхронная и блокирует event
+        # loop — LangGraph такое отлавливает и роняет узел. Уводим в один поток.
+        hit = await asyncio.to_thread(_read_cache, cache_dir, cached)
+        if hit is not None:
+            return hit
 
         try:
             async with httpx.AsyncClient(
@@ -326,6 +361,19 @@ class AcceleratorAPI:
 
         await asyncio.to_thread(cached.write_bytes, data)
         return data
+
+
+def _read_cache(cache_dir: Path, cached: Path) -> bytes | None:
+    """Синхронная работа с ФС в ОДНОМ месте: создать каталог кеша и прочитать
+    файл, если он уже есть.
+
+    Вынесено отдельной функцией, чтобы целиком уходить в asyncio.to_thread:
+    mkdir/exists/read блокируют event loop, а в async-узле это падает.
+    """
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    if cached.exists():
+        return cached.read_bytes()
+    return None
 
 
 def cache_path_for(url: str) -> Path:

@@ -26,6 +26,7 @@ src/requirements_flow/models.py
 src/requirements_flow/prompts.py
 src/requirements_flow/service.py
 src/team/__init__.py
+src/team/directory.py
 src/team/models.py
 src/team/prompts.py
 src/team/service.py
@@ -37,3 +38,6 @@ src/techspec/render.py
 src/techspec/service.py
 src/utils/__init__.py
 src/utils/llm_gen.py
+tests/test_client.py
+tests/test_routers.py
+tests/test_summary.py

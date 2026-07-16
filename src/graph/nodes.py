@@ -27,7 +27,9 @@ from src.api.documents import extract_text, pick_spec_file
 from src.core.config import settings
 from src.graph.interrupts import (
     KIND_ASK_QUESTIONS,
+    KIND_CONFIRM_RENAME,
     KIND_CONFIRM_SPEC,
+    KIND_EDIT_INTENT,
     KIND_MORE_OR_GENERATE,
     KIND_SELECT_PROJECT,
     KIND_TEAM_READY,
@@ -44,7 +46,12 @@ from src.requirements_flow.service import next_questions
 from src.team.service import collect_candidate_ids, match_team, merge_team
 from src.techspec.card import make_card
 from src.techspec.render import DOCX_MIME, markdown_to_docx
-from src.techspec.service import generate_spec, refine_spec, spec_file_name
+from src.techspec.service import (
+    extract_roles_from_spec,
+    generate_spec,
+    refine_spec,
+    spec_file_name,
+)
 from src.utils.llm_gen import LLMOverloadedError
 
 log = logging.getLogger(__name__)
@@ -241,6 +248,8 @@ async def load_spec_node(state: AgentState, runtime: Runtime[Context]) -> dict:
             return {
                 "existing_spec_text": (project.get("description") or "").strip(),
                 "spec_title": project.get("title"),
+                "spec_summary": (project.get("description") or "").strip(),
+                "edit_project": project,
             }
 
         data = await api.download_file(spec_file["file_url"])
@@ -255,9 +264,134 @@ async def load_spec_node(state: AgentState, runtime: Runtime[Context]) -> dict:
             "existing_spec_text": text,
             "existing_spec_file": spec_file,
             "spec_title": project.get("title"),
+            "spec_summary": (project.get("description") or "").strip(),
+            "edit_project": project,
         }
     except Exception as exc:  # noqa: BLE001
         return {"error": f"Не удалось прочитать ТЗ проекта: {exc}"}
+
+
+# ─── 2.5. краткая сводка проекта + развилка «что делаем» ────────────────────
+
+def _roles_from_project(project: dict) -> list[str]:
+    """Роли из состава специалистов проекта (если он задан в БД)."""
+    roles: list[str] = []
+    for rs in (project or {}).get("required_specialists") or []:
+        name = rs.get("profession_name")
+        if name and name not in roles:
+            roles.append(name)
+    return roles
+
+
+def build_edit_summary(
+    project: dict,
+    invitations: list[dict] | None,
+    *,
+    char_limit: int = 300,
+) -> str:
+    """Краткая детерминированная сводка проекта для доработки.
+
+    invitations=None → приглашения не удалось получить, счётчики по ним не
+    показываем (не путаем «0» с «неизвестно»).
+    """
+    title = project.get("title") or f"Проект #{project.get('id')}"
+    has_spec = bool(pick_spec_file(project.get("files") or []))
+    responses = int(project.get("responses_count") or 0)
+    required = int(project.get("specialists_count") or 0)
+
+    lines = [f"Проект «{title}»:"]
+    lines.append(
+        "— техническое задание: "
+        + ("файл прикреплён" if has_spec else "файла нет, есть только описание")
+    )
+    if required:
+        lines.append(f"— требуется по проекту: {required} чел.")
+    lines.append(f"— откликов от специалистов: {responses}")
+
+    if invitations is not None:
+        potential = sum(
+            1 for i in invitations if str(i.get("status")).lower() == "potential"
+        )
+        accepted = sum(
+            1 for i in invitations if str(i.get("status")).lower() == "accepted"
+        )
+        lines.append(f"— претендентов (наброски подборки): {potential}")
+        lines.append(f"— в команде (приняли приглашение): {accepted}")
+
+    desc = (project.get("description") or "").strip()
+    if desc:
+        if len(desc) > char_limit:
+            desc = desc[:char_limit].rstrip() + "…"
+        lines.append(f"— кратко: {desc}")
+
+    return "\n".join(lines)
+
+
+async def edit_menu_node(state: AgentState, runtime: Runtime[Context]) -> dict:
+    """Показывает краткую сводку проекта и спрашивает, что с ним делать.
+
+    Развилка: только правка ТЗ / только подбор команды / и то, и другое.
+    Для маршрута «только команда» здесь же готовим роли — их берём из состава
+    специалистов проекта, а если он пуст (проект заведён ассистентом) — извлекаем
+    из текста ТЗ.
+    """
+    if _skip_on_error(state) or state.get("edit_intent"):
+        return {}
+
+    project = state.get("edit_project") or {}
+
+    # Сводка — детерминированная; один запрос за приглашениями (может не быть прав).
+    api = _api(runtime)
+    invitations: list[dict] | None
+    try:
+        invitations = await api.list_project_invitations(int(project.get("id")))
+    except Exception as exc:  # noqa: BLE001
+        log.info("Не удалось получить приглашения проекта для сводки: %s", exc)
+        invitations = None
+
+    summary = build_edit_summary(project, invitations)
+
+    choices = [
+        Choice(id="spec", title="Доработать техническое задание"),
+        Choice(id="team", title="Подобрать команду"),
+        Choice(id="both", title="И то, и другое"),
+    ]
+    message = (
+        f"{summary}\n\n"
+        "Что делаем с проектом?\n"
+        f"{render_choices(choices)}"
+    )
+
+    reply = ask(Ask(kind=KIND_EDIT_INTENT, message=message, choices=choices, data={"summary": summary}))
+    choice = await resolve(reply, choices)
+    turn = _turn(message, reply, choices)
+
+    if choice not in ("spec", "team", "both"):
+        # Не разобрали — переспрашиваем (ребро ведёт обратно в этот же узел).
+        return {
+            "messages": turn
+            + [AIMessage(content="Уточните: доработать ТЗ, подобрать команду или и то, и другое?")]
+        }
+
+    emit("edit_menu", {"spec": "Дорабатываем ТЗ", "team": "Подбираем команду", "both": "ТЗ и команда"}[choice])
+
+    result: dict = {"edit_intent": choice, "messages": turn}
+
+    if choice == "team":
+        # ТЗ не правим — роли нужны сразу, готовим их здесь.
+        roles = _roles_from_project(project)
+        if not roles:
+            try:
+                roles = await extract_roles_from_spec(state.get("existing_spec_text") or "")
+            except LLMOverloadedError as exc:
+                return {"error": str(exc)}
+            except Exception as exc:  # noqa: BLE001
+                return {"error": f"Не удалось определить состав команды по ТЗ: {exc}"}
+        result["roles_needed"] = roles
+        # match_team берёт ТЗ как контекст — на этом маршруте это существующее ТЗ.
+        result["spec_text"] = state.get("existing_spec_text") or ""
+
+    return result
 
 
 # ─── 3. сбор требований ─────────────────────────────────────────────────────
@@ -447,16 +581,25 @@ async def refine_spec_node(state: AgentState, runtime: Runtime[Context]) -> dict
 
     try:
         emit("refine_spec", "Вношу правки в техническое задание…")
-        refined = await refine_spec(current, _dialog(state))
+        refined = await refine_spec(
+            current, _dialog(state), current_title=state.get("spec_title") or ""
+        )
     except LLMOverloadedError as exc:
         return {"error": str(exc)}
     except Exception as exc:  # noqa: BLE001
         return {"error": f"Не удалось обновить ТЗ: {exc}"}
 
+    # Новое название предлагаем только если оно реально другое (не пустое и не то же).
+    current_title = (state.get("spec_title") or "").strip()
+    proposed = (refined.proposed_title or "").strip()
+    proposed_title = proposed if proposed and proposed != current_title else None
+
     return {
         "spec_text": refined.tech_spec_text,
         "spec_changes": refined.change_summary,
         "roles_needed": refined.roles_needed or state.get("roles_needed") or [],
+        "roles_changed": bool(refined.roles_changed),
+        "proposed_title": proposed_title,
         "spec_summary": state.get("spec_summary")
         or "Обновлённое техническое задание проекта",
     }
@@ -525,6 +668,44 @@ async def confirm_spec_node(state: AgentState, runtime: Runtime[Context]) -> dic
     }
 
 
+# ─── 5.5. переименование проекта (если суть сменилась) ──────────────────────
+
+async def confirm_rename_node(state: AgentState, runtime: Runtime[Context]) -> dict:
+    """Спрашивает про переименование проекта, если правки сменили его суть.
+
+    Срабатывает ТОЛЬКО когда refine предложил новое название (proposed_title). В
+    остальных случаях (создание проекта, правки без смены сути) — проходной узел
+    без паузы. Заказчик просил: спросить, но переименовать самим при согласии.
+    """
+    if _skip_on_error(state):
+        return {}
+
+    proposed = (state.get("proposed_title") or "").strip()
+    current = (state.get("spec_title") or "").strip()
+    if not proposed or proposed == current:
+        return {}  # переименовывать нечего — идём дальше без вопроса
+
+    message = (
+        f"Из-за правок суть проекта изменилась — название «{current}» больше не "
+        f"подходит. Переименовать проект в «{proposed}»?"
+    )
+    choices = [
+        Choice(id="yes", title=f"Да, переименовать в «{proposed}»"),
+        Choice(id="no", title="Нет, оставить прежнее"),
+    ]
+
+    reply = ask(Ask(kind=KIND_CONFIRM_RENAME, message=message, choices=choices))
+    choice = await resolve(reply, choices)
+    turn = _turn(message, reply, choices)
+
+    if choice == "yes":
+        emit("confirm_rename", f"Переименовываю проект в «{proposed}»")
+        return {"rename_confirmed": True, "spec_title": proposed, "messages": turn}
+
+    # «Нет» или непонятный ответ — не рискуем переименованием, оставляем как было.
+    return {"rename_confirmed": False, "messages": turn}
+
+
 # ─── 6. прикрепление файла ТЗ (параллельно с подбором) ──────────────────────
 
 async def attach_spec_node(state: AgentState, runtime: Runtime[Context]) -> dict:
@@ -548,10 +729,11 @@ async def attach_spec_node(state: AgentState, runtime: Runtime[Context]) -> dict
         emit("attach_spec", "Сохраняю ТЗ в проект…")
 
         if state.get("mode") == "edit":
-            await api.update_project(
-                int(project_id),
-                {"description": state.get("spec_summary") or ""},
-            )
+            patch = {"description": state.get("spec_summary") or ""}
+            # Заказчик согласился переименовать — обновляем и название проекта.
+            if state.get("rename_confirmed") and (state.get("spec_title") or "").strip():
+                patch["title"] = state.get("spec_title")
+            await api.update_project(int(project_id), patch)
 
         version = 2 if state.get("mode") == "edit" else 1
         file_name = spec_file_name(title, version=version)
@@ -594,10 +776,13 @@ async def match_team_node(state: AgentState, runtime: Runtime[Context]) -> dict:
 
     try:
         api = _api(runtime)
+        # На маршруте «только команда» refine не запускался — берём существующее ТЗ.
+        spec_text = state.get("spec_text") or state.get("existing_spec_text") or ""
+        spec_summary = state.get("spec_summary") or ""
         team = await match_team(
             state.get("roles_needed") or [],
-            state.get("spec_text") or "",
-            state.get("spec_summary") or "",
+            spec_text,
+            spec_summary,
             api,
             exclude_ids=state.get("candidate_ids") or [],
             progress=progress_for("match_team"),
@@ -657,6 +842,103 @@ async def present_team_node(state: AgentState, runtime: Runtime[Context]) -> dic
     if choice == "more":
         return {"wants_more_candidates": True, "messages": turn}
     return {"wants_more_candidates": False, "messages": turn}
+
+
+# ─── 6.5. запись подборки в проект ──────────────────────────────────────────
+
+def _required_specialists_from_team(team: list[dict]) -> list[dict]:
+    """Собирает состав специalистов проекта из подобранных ролей.
+
+    Роль → основная профессия (первый profession_id) и нужное количество. Если
+    одна профессия встречается в нескольких ролях — количества суммируем. Роли
+    без сопоставленной профессии пропускаем.
+
+    Формат под ProjectUpdate.required_specialists: [{profession_id, count}].
+    """
+    by_prof: dict[int, int] = {}
+    for block in team or []:
+        pids = block.get("profession_ids") or []
+        if not pids:
+            continue
+        pid = int(pids[0])
+        by_prof[pid] = by_prof.get(pid, 0) + int(block.get("count") or 1)
+    return [{"profession_id": pid, "count": cnt} for pid, cnt in by_prof.items()]
+
+
+async def save_candidates_node(state: AgentState, runtime: Runtime[Context]) -> dict:
+    """Пишет в проект состав ролей и подобранных претендентов.
+
+    Идёт после подтверждения подборки («достаточно»). В БД проекта попадает:
+      1) состав специалистов (required_specialists) — из подобранных ролей, чтобы
+         у проекта заполнились «Требуемые специалисты» и счётчик specialists_count;
+      2) сами претенденты (статус POTENTIAL) — POST /candidates.
+
+    Роли пишем ПЕРВЫМИ (как при обычном создании: сначала роли проекта, потом
+    подбор под них). До этого узла команда жила только в стейте графа.
+    """
+    if _skip_on_error(state):
+        return {}
+
+    project_id = state.get("target_project_id")
+    if not project_id:
+        return {}
+
+    api = _api(runtime)
+    team = state.get("team") or []
+
+    # 1) состав специалистов проекта — из подобранных ролей.
+    required = _required_specialists_from_team(team)
+    if required:
+        try:
+            await api.update_project(
+                int(project_id), {"required_specialists": required}
+            )
+            log.info("Состав ролей записан в проект #%s: %s", project_id, required)
+        except Exception as exc:  # noqa: BLE001
+            # Роли — не критично для показа подборки; прогон не рушим.
+            log.error(
+                "Не удалось записать состав ролей в проект #%s: %s", project_id, exc
+            )
+
+    # 2) претенденты (POTENTIAL).
+    intern_ids = collect_candidate_ids(team)
+    if not intern_ids:
+        # Никого не подобрали — роли (если были) записали, идём дальше.
+        return {}
+
+    try:
+        emit("save_candidates", "Сохраняю подобранную команду в проект…")
+        result = await api.add_candidates(int(project_id), intern_ids)
+
+        created = result.get("created", [])
+        skipped = result.get("skipped", [])
+        log.info(
+            "Подборка записана в проект #%s: создано=%d, пропущено=%d",
+            project_id,
+            len(created),
+            len(skipped),
+        )
+        if skipped:
+            log.info("Пропущены при записи: %s", skipped)
+
+        return {
+            "messages": [
+                AIMessage(
+                    content=f"Сохранил подобранную команду в проект — {len(created)} чел."
+                )
+            ]
+        }
+    except Exception as exc:  # noqa: BLE001
+        # Подборка уже показана заказчику; не рушим весь прогон из-за записи.
+        log.error("Не удалось записать подборку в проект #%s: %s", project_id, exc)
+        return {
+            "messages": [
+                AIMessage(
+                    content="Подборку показал, но сохранить в проект не удалось — "
+                    "попробуйте позже."
+                )
+            ]
+        }
 
 
 # ─── 7. презентация (бизнес-логика; включается флагом) ──────────────────────

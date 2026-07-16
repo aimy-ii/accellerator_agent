@@ -19,6 +19,8 @@ Requires-Dist: pypandoc-binary>=1.17
 Provides-Extra: dev
 Requires-Dist: mypy>=1.11.1; extra == "dev"
 Requires-Dist: ruff>=0.6.1; extra == "dev"
+Requires-Dist: pytest>=8.0; extra == "dev"
+Requires-Dist: pytest-asyncio>=0.24; extra == "dev"
 
 # Accelerator Customer Agent
 

@@ -27,9 +27,11 @@ log = logging.getLogger(__name__)
 
 # Типы пауз. Фронту нужны только чтобы решить, рисовать ли доп-виджет из data.
 KIND_SELECT_PROJECT = "select_project"      # выбрать проект / создать новый
+KIND_EDIT_INTENT = "edit_intent"            # что делаем с проектом (data: сводка)
 KIND_ASK_QUESTIONS = "ask_questions"        # вопросы (поле ввода)
 KIND_MORE_OR_GENERATE = "more_or_generate"  # ещё вопросы или пишем ТЗ
 KIND_CONFIRM_SPEC = "confirm_spec"          # подтвердить ТЗ (data: текст ТЗ)
+KIND_CONFIRM_RENAME = "confirm_rename"      # переименовать проект (суть сменилась)
 KIND_TEAM_READY = "team_ready"              # подборка команды (data: карточки)
 
 

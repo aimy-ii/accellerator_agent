@@ -8,3 +8,27 @@ output/
 .mypy_cache/
 .ruff_cache/
 .pytest_cache/
+*.egg-info/
+# ─── IDE / редакторы / AI-инструменты ───────────────────────────────
+.idea/
+.vscode/
+.cursor/
+.cursorignore
+.cursorrules
+.kodik/
+.aider*
+.claude/
+.continue/
+.windsurf/
+*.swp
+*.swo
+*~
+.history/
+
+# ─── ОС ─────────────────────────────────────────────────────────────
+.DS_Store
+Thumbs.db
+
+# ─── прочее ─────────────────────────────────────────────────────────
+*.log
+.cache/
