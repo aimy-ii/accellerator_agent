@@ -7,20 +7,28 @@
     load_projects → select_project ⇄ (выбор не разобран)
        ├─ create ─► ask_questions ⇄ more_or_generate ─┬─► create_project (секунда) ─┐
        │                                              └─► generate_spec  (минута)  ─┤
-       └─ edit  ──► load_spec ─► ask_questions ⇄ more_or_generate ──► refine_spec ──┤
+       └─ edit  ──► load_spec ─► edit_menu (сводка + развилка):                     │
+                       ├─ team ─────────────────────────────► match_team           │
+                       ├─ spec ─┐                                                    │
+                       └─ both ─┴─► ask_questions ⇄ more_or_generate ─► refine_spec ┤
                                                                                          │
                               ┌──────────────────────────────────────────────────────────┘
                               ▼
                        confirm_spec ──(нужны правки)──► refine_spec
                               │ (подтверждено)
+                       confirm_rename ──(суть сменилась: спросить/переименовать)
+                              │
                               ├──────────► attach_spec   (файл ТЗ → проект)  ┐
-                              └──────────► match_team    (подбор спецов)     ┘ ПАРАЛЛЕЛЬНО
+                              └──────────► match_team    (подбор спецов)     ┘ ПАРАЛЛЕЛЬНО*
                                                   │
                                           present_team ──(подобрать ещё)──► match_team
                                                   │ (достаточно)
                                           save_candidates (POST в проект)
                                                   ▼
                                           presentation → finalize → __end__
+
+  *подбор при доработке — только для 'team'/'both', а для 'spec' лишь если
+   правки изменили состав ролей; иначе attach_spec идёт сразу в finalize.
 
 Ключевое:
   * проект создаётся ОДНОВРЕМЕННО с написанием ТЗ — он появляется в списке
@@ -41,8 +49,10 @@ from langgraph.graph import StateGraph
 from src.graph.nodes import (
     ask_questions_node,
     attach_spec_node,
+    confirm_rename_node,
     confirm_spec_node,
     create_project_node,
+    edit_menu_node,
     finalize_node,
     generate_spec_node,
     guard_node,
@@ -83,9 +93,43 @@ def _after_select(
     return "select_project"
 
 
-def _after_load_spec(state: AgentState) -> Literal["ask_questions", "finalize"]:
-    """Старое ТЗ поднято в скрытый контекст — спрашиваем про изменения."""
-    return "finalize" if state.get("error") else "ask_questions"
+def _after_load_spec(state: AgentState) -> Literal["edit_menu", "finalize"]:
+    """Старое ТЗ поднято в скрытый контекст — показываем сводку и спрашиваем, что делаем."""
+    return "finalize" if state.get("error") else "edit_menu"
+
+
+def _after_edit_menu(
+    state: AgentState,
+) -> Literal["ask_questions", "match_team", "edit_menu", "finalize"]:
+    """Развилка доработки: только ТЗ / только команда / и то, и другое.
+
+    team — сразу к подбору (ТЗ не трогаем); spec и both — через сбор требований
+    и правку ТЗ. Выбор не разобрали — переспрашиваем (ребро в тот же узел).
+    """
+    if state.get("error"):
+        return "finalize"
+    intent = state.get("edit_intent")
+    if intent == "team":
+        return "match_team"
+    if intent in ("spec", "both"):
+        return "ask_questions"
+    return "edit_menu"
+
+
+def _should_match_team(state: AgentState) -> bool:
+    """Нужен ли (пере)подбор команды на этом прогоне.
+
+    create — всегда. edit: 'both' — всегда; 'spec' — только если правки изменили
+    состав ролей (roles_changed); 'team' идёт мимо этой развилки, сразу в подбор.
+    """
+    if state.get("mode") == "create":
+        return True
+    intent = state.get("edit_intent")
+    if intent == "both":
+        return True
+    if intent == "spec":
+        return bool(state.get("roles_changed"))
+    return True
 
 
 def _to_spec(state: AgentState) -> list[str]:
@@ -134,22 +178,44 @@ def _after_spec(state: AgentState) -> Literal["confirm_spec", "finalize"]:
 
 def _after_confirm(
     state: AgentState,
-) -> list[Literal["attach_spec", "match_team", "refine_spec", "finalize"]]:
-    """Подтверждено → крепим ТЗ и подбираем команду ОДНОВРЕМЕННО.
+) -> Literal["confirm_rename", "refine_spec", "finalize"]:
+    """ТЗ подтверждено → шаг переименования (спросит только если суть сменилась).
+
+    Не подтверждено (кнопка «нужны правки» или замечания текстом) — круг правки.
+    """
+    if state.get("error"):
+        return "finalize"
+    if not state.get("spec_confirmed"):
+        return "refine_spec"
+    return "confirm_rename"
+
+
+def _after_rename(
+    state: AgentState,
+) -> list[Literal["attach_spec", "match_team", "finalize"]]:
+    """Крепим файл ТЗ и (при необходимости) подбираем команду ОДНОВРЕМЕННО.
 
     Возврат списка = fan-out: LangGraph запускает узлы параллельно в одном
-    супершаге и сходится на present_team, когда оба закончат.
+    супершаге и сходится на present_team, когда оба закончат. Подбор добавляем
+    только если он нужен на этом прогоне (см. _should_match_team).
     """
     if state.get("error"):
         return ["finalize"]
-    if not state.get("spec_confirmed"):
-        return ["refine_spec"]
-    return ["attach_spec", "match_team"]
+    targets: list[str] = ["attach_spec"]
+    if _should_match_team(state):
+        targets.append("match_team")
+    return targets  # type: ignore[return-value]
 
 
 def _after_attach(state: AgentState) -> Literal["present_team", "finalize"]:
-    """Файл ТЗ прикреплён — ждём вторую ветку (подбор) на present_team."""
-    return "finalize" if state.get("error") else "present_team"
+    """Файл ТЗ прикреплён. Если шёл подбор — сходимся на present_team; иначе финал.
+
+    На маршруте «только ТЗ без смены ролей» команду не трогали — показывать и
+    сохранять нечего, идём прямо в финал.
+    """
+    if state.get("error"):
+        return "finalize"
+    return "present_team" if _should_match_team(state) else "finalize"
 
 
 def _after_match(state: AgentState) -> Literal["present_team", "finalize"]:
@@ -177,12 +243,14 @@ builder = (
     .add_node("load_projects", load_projects_node)
     .add_node("select_project", select_project_node)
     .add_node("load_spec", load_spec_node)
+    .add_node("edit_menu", edit_menu_node)
     .add_node("ask_questions", ask_questions_node)
     .add_node("more_or_generate", more_or_generate_node)
     .add_node("create_project", create_project_node)
     .add_node("generate_spec", generate_spec_node)
     .add_node("refine_spec", refine_spec_node)
     .add_node("confirm_spec", confirm_spec_node)
+    .add_node("confirm_rename", confirm_rename_node)
     .add_node("attach_spec", attach_spec_node)
     .add_node("match_team", match_team_node)
     .add_node("present_team", present_team_node)
@@ -200,7 +268,12 @@ builder = (
         _after_select,
         ["load_spec", "ask_questions", "select_project", "finalize"],
     )
-    .add_conditional_edges("load_spec", _after_load_spec, ["ask_questions", "finalize"])
+    .add_conditional_edges("load_spec", _after_load_spec, ["edit_menu", "finalize"])
+    .add_conditional_edges(
+        "edit_menu",
+        _after_edit_menu,
+        ["ask_questions", "match_team", "edit_menu", "finalize"],
+    )
     # fan-out: проект создаётся ПАРАЛЛЕЛЬНО с написанием ТЗ
     .add_conditional_edges(
         "ask_questions",
@@ -217,11 +290,16 @@ builder = (
     )
     .add_conditional_edges("generate_spec", _after_spec, ["confirm_spec", "finalize"])
     .add_conditional_edges("refine_spec", _after_spec, ["confirm_spec", "finalize"])
-    # fan-out: attach_spec и match_team идут ПАРАЛЛЕЛЬНО
     .add_conditional_edges(
         "confirm_spec",
         _after_confirm,
-        ["attach_spec", "match_team", "refine_spec", "finalize"],
+        ["confirm_rename", "refine_spec", "finalize"],
+    )
+    # fan-out: attach_spec и match_team идут ПАРАЛЛЕЛЬНО (подбор — по надобности)
+    .add_conditional_edges(
+        "confirm_rename",
+        _after_rename,
+        ["attach_spec", "match_team", "finalize"],
     )
     .add_conditional_edges("attach_spec", _after_attach, ["present_team", "finalize"])
     .add_conditional_edges("match_team", _after_match, ["present_team", "finalize"])

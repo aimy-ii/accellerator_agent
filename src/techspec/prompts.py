@@ -112,7 +112,11 @@ REFINE_SYSTEM = """Ты правишь СУЩЕСТВУЮЩЕЕ техничес
 4. НЕ добавляй в документ changelog, историю версий, «конец документа», даты.
 5. Не выдумывай новую функциональность сверх того, что просил заказчик.
 6. Что именно изменилось — по пунктам в поле `change_summary` (это увидит заказчик).
-7. Если правки затронули состав команды — обнови `roles_needed`.
+7. Если правки затронули состав команды — обнови `roles_needed` и укажи
+   `roles_changed` = true. Если состав ролей не изменился — `roles_changed` = false.
+8. Если из-за правок СУТЬ проекта изменилась так, что прежнее название больше не
+   подходит (был «бот», стал «мобильное приложение») — верни новое короткое
+   название в `proposed_title`. Если название по-прежнему уместно — `proposed_title` = null.
 
 Ответ — строго валидный JSON по схеме. Ничего вне JSON."""
 
@@ -131,9 +135,13 @@ def generate_user_message(dialog: str, *, assumptions_hint: str | None = None) -
     return "\n\n".join(parts)
 
 
-def refine_user_message(current_spec: str, dialog: str) -> str:
+def refine_user_message(current_spec: str, dialog: str, current_title: str = "") -> str:
     """User-сообщение для правки существующего ТЗ."""
+    title_line = (
+        f"Текущее название проекта: «{current_title}».\n\n" if current_title else ""
+    )
     return (
+        f"{title_line}"
         "Действующее ТЗ проекта:\n"
         f"---\n{current_spec}\n---\n\n"
         "Диалог с заказчиком (его замечания и пожелания):\n"

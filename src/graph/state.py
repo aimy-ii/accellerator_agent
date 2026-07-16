@@ -55,6 +55,11 @@ class AgentState(TypedDict, total=False):
     # Заказчик этого в чате НЕ видит — ИИ просто «уже знаком» с проектом.
     existing_spec_text: Optional[str]
     existing_spec_file: Optional[dict]
+    edit_project: Optional[dict]    # проект целиком (для сводки + ролей из БД)
+
+    # что именно делаем с проектом при доработке:
+    #   spec — только правим ТЗ; team — только подбираем команду; both — и то, и то.
+    edit_intent: Optional[Literal["spec", "team", "both"]]
 
     # ── сбор требований ─────────────────────────────────────────────────────
     question_rounds: int            # сколько ходов вопросов уже задали
@@ -70,8 +75,13 @@ class AgentState(TypedDict, total=False):
     spec_assumptions: list[str]
     spec_changes: list[str]         # что изменилось (режим edit)
     roles_needed: list[str]
+    roles_changed: bool             # правки ТЗ изменили состав ролей (из refine)
     spec_file_url: Optional[str]    # ТЗ, прикреплённое к проекту
     spec_confirmed: bool            # заказчик подтвердил ТЗ (роутер читает это, не текст)
+
+    # ── переименование проекта при доработке ТЗ ─────────────────────────────
+    proposed_title: Optional[str]   # новое название, если суть сменилась (из refine)
+    rename_confirmed: bool          # заказчик согласился переименовать проект
 
     # ── команда (пока ТОЛЬКО в state, в БД не пишем) ────────────────────────
     team: list[dict]                # [{role, candidates: [...]}, ...]
@@ -98,11 +108,13 @@ def new_state_defaults() -> dict[str, Any]:
         "spec_assumptions": [],
         "spec_changes": [],
         "roles_needed": [],
+        "roles_changed": False,
         "team": [],
         "candidate_ids": [],
         "question_rounds": 0,
         "ready_to_generate": False,
         "spec_confirmed": False,
+        "rename_confirmed": False,
         "wants_more_candidates": False,
         "finished": False,
     }

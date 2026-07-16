@@ -6,6 +6,7 @@ import re
 from datetime import datetime, timezone
 
 from langchain_core.messages import HumanMessage, SystemMessage
+from pydantic import BaseModel, Field
 
 from src.requirements_flow.prompts import format_dialog
 from src.techspec.models import RefinedSpec, TechSpec
@@ -63,8 +64,18 @@ async def generate_spec(
     return result
 
 
-async def refine_spec(current_spec: str, messages: list[dict]) -> RefinedSpec:
-    """Точечно правит существующее ТЗ по замечаниям из диалога."""
+async def refine_spec(
+    current_spec: str,
+    messages: list[dict],
+    *,
+    current_title: str = "",
+) -> RefinedSpec:
+    """Точечно правит существующее ТЗ по замечаниям из диалога.
+
+    Args:
+        current_title: текущее название проекта — модель решит, не устарело ли оно
+            после правок (см. RefinedSpec.proposed_title).
+    """
     log.info("Правка ТЗ: длина исходного=%d символов", len(current_spec))
 
     async with get_llm(temperature=0.1, max_tokens=16000) as llm:
@@ -74,12 +85,61 @@ async def refine_spec(current_spec: str, messages: list[dict]) -> RefinedSpec:
             [
                 SystemMessage(content=REFINE_SYSTEM),
                 HumanMessage(
-                    content=refine_user_message(current_spec, format_dialog(messages))
+                    content=refine_user_message(
+                        current_spec, format_dialog(messages), current_title
+                    )
                 ),
             ],
         )
-    log.info("ТЗ обновлено: изменений=%d", len(result.change_summary))
+    log.info(
+        "ТЗ обновлено: изменений=%d, роли изменились=%s, новое название=%s",
+        len(result.change_summary),
+        result.roles_changed,
+        result.proposed_title,
+    )
     return result
+
+
+_ROLES_SYSTEM = """Ты выделяешь состав команды из готового технического задания.
+
+Верни список ролей простыми словами — кто нужен, чтобы сделать проект:
+например 'Backend-разработчик', 'Frontend-разработчик', 'Дизайнер', 'QA-инженер'.
+
+Правила:
+1. Опирайся только на текст ТЗ. Не выдумывай ролей сверх нужного.
+2. Каждая роль — отдельным элементом. Без количества, без пояснений.
+
+Верни строго JSON по схеме. Ничего вне JSON."""
+
+
+class _SpecRoles(BaseModel):
+    """Роли, извлечённые из готового ТЗ."""
+
+    roles_needed: list[str] = Field(
+        default_factory=list,
+        description="Список ролей команды простыми словами (кто нужен на проект)",
+    )
+
+
+async def extract_roles_from_spec(spec_text: str) -> list[str]:
+    """Достаёт состав ролей из готового ТЗ.
+
+    Нужно для маршрута «только подобрать команду» при доработке проекта: там ТЗ
+    не правится, а roles_needed в стейте нет (проект пришёл из БД).
+    """
+    if not (spec_text or "").strip():
+        return []
+    async with get_llm(temperature=0.0, fast=True) as llm:
+        structured = llm.with_structured_output(_SpecRoles)
+        result: _SpecRoles = await ainvoke_llm(
+            structured,
+            [
+                SystemMessage(content=_ROLES_SYSTEM),
+                HumanMessage(content=f"Техническое задание:\n---\n{spec_text}\n---"),
+            ],
+        )
+    log.info("Из ТЗ извлечено ролей: %d", len(result.roles_needed))
+    return result.roles_needed
 
 
 def slugify(title: str) -> str:
