@@ -206,13 +206,40 @@ make test          # или: uv run pytest -q
 
 ## Прод
 
+Прод-стек — `docker-compose.yml` в корне: Redis (стрим/pub-sub) + Postgres
+(чекпойнтер/`interrupt`-resume) + `langgraph-api` (образ собирается через
+`langgraph build`, тег `accelerator_agent`). Наружу торчит только порт `8123`.
+
+Одной командой (собрать image + поднять весь стек):
+
 ```bash
-langgraph build -t accelerator_agent
-langgraph up --wait          # LangGraph Server + Postgres + Redis
+make prod
 ```
 
-Наружу LangGraph Server **не выставлять** — только через свой FastAPI-шлюз
-(валидирует заказчика и прокидывает JWT в `context` на каждый run).
+Пошагово то же самое:
+
+```bash
+make build_image   # uv run langgraph build -t accelerator_agent
+make up            # docker compose up -d (Redis + Postgres + API)
+```
+
+Прочие команды:
+
+```bash
+make restart        # пересобрать image и пересоздать только langgraph-api
+make logs            # логи API (follow)
+make logs_tail        # последние 200 строк логов API
+make ps               # docker compose ps
+make api_ok           # curl http://localhost:8123/ok
+make down             # остановить стек (volumes сохраняются)
+```
+
+`.env` в корне обязателен — из него читаются `LLM_*`, `API_BASE_URL`,
+`LANGSMITH_API_KEY` и т.д.; `REDIS_URI`/`DATABASE_URI` докомпоуз подставляет сам
+(указывают на контейнеры `langgraph-redis`/`langgraph-postgres`).
+
+LangGraph Server **не выставлять** напрямую заказчику — только через свой
+FastAPI-шлюз (валидирует заказчика и прокидывает JWT в `context` на каждый run).
 
 ---
 

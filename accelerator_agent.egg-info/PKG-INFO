@@ -24,97 +24,155 @@ Requires-Dist: pytest-asyncio>=0.24; extra == "dev"
 
 # Accelerator Customer Agent
 
-ИИ-ассистент заказчика для акселератора: собирает ТЗ в диалоге, сохраняет проект,
-подбирает команду, готовит презентацию. LangGraph Server + свой чекпоинтер.
+ИИ-ассистент заказчика для акселератора: собирает требования в диалоге, заводит
+проект, пишет ТЗ, подбирает команду, при необходимости готовит презентацию.
+На LangGraph — граф с паузами (`interrupt`) под общение с заказчиком.
 
 ---
 
 ## Что делает
 
+```mermaid
+flowchart TD
+    start([старт]) --> guard{чат уже<br/>отработал?}
+    guard -->|да| done_msg[/«начните новый чат»/]
+    guard -->|нет| load_projects[load_projects]
+    load_projects --> select{select_project<br/>выбрать / создать}
+    select -.не разобрал.-> select
+    select -->|доработать| load_spec[load_spec<br/>старое ТЗ в скрытый контекст]
+    select -->|создать| ask
+
+    load_spec --> edit{edit_menu<br/>сводка + развилка}
+    edit -.не разобрал.-> edit
+    edit -->|подобрать команду| match_team
+    edit -->|доработать ТЗ / и то, и другое| ask
+
+    ask[ask_questions ⇄ more_or_generate<br/>сбор требований]
+    ask -->|создание| gen
+    ask -->|доработка| refine[refine_spec<br/>правка ТЗ]
+
+    subgraph gen [создание ТЗ — параллельно]
+      direction LR
+      create_project[create_project<br/>завести проект]
+      generate_spec[generate_spec<br/>написать ТЗ]
+    end
+    gen --> confirm
+    refine --> confirm
+
+    confirm{confirm_spec<br/>подтвердить?}
+    confirm -->|нужны правки| refine
+    confirm -->|ок| rename{confirm_rename<br/>суть сменилась?}
+
+    rename -->|всегда| attach[attach_spec<br/>файл ТЗ → проект]
+    rename -->|роли изменились / both| match_team[match_team<br/>подбор спецов]
+
+    attach --> present
+    attach -. только ТЗ, роли те же .-> finalize
+    match_team --> present{present_team<br/>достаточно?}
+    present -->|подобрать ещё| match_team
+    present -->|достаточно| save[save_candidates<br/>роли + претенденты → проект]
+
+    save --> presentation[presentation<br/>опц.]
+    presentation --> finalize([finalize])
+    done_msg --> stop([конец])
+    finalize --> stop
+
+    classDef pause fill:#eef,stroke:#66f,color:#000;
+    class guard,select,edit,confirm,rename,present pause;
 ```
-guard ──(чат уже отработал)────────────────────────────────► новый чат
-  │
-load_projects → select_project  «Вижу ваши проекты — их N. Доработаем или новый?»
-  ├─ create ─► ask_questions ⇄ more_or_generate ─► generate_spec ─┐
-  └─ edit  ──► load_spec (скрытый контекст) ─► ask_questions ⇄ ... ─► refine_spec ─┤
-                                                                                   ▼
-                                                      confirm_spec ──(правки)──► refine_spec
-                                                             │ (ок)
-                                                      persist_project  (POST/PATCH + файл ТЗ)
-                                                             ▼
-                                                      match_team → present_team ──(ещё)──► match_team
-                                                             │ (достаточно)
-                                                      presentation → finalize
-```
+
+\* Подбор при доработке запускается для «Подобрать команду» и «И то, и другое»
+всегда, а для «Доработать ТЗ» — только если правки **изменили состав ролей**.
+Иначе после `attach_spec` граф идёт сразу в финал, команду не трогая.
 
 ### Ключевые решения
 
 | Решение | Как сделано |
 |---|---|
-| **Токен заказчика** | В `Context` (configurable), **НЕ в state** — state уходит в чекпоинт БД. Обновляется на каждый run. |
+| **Токен заказчика** | В `Context` (configurable), **не в state** — state уходит в чекпоинт. Обновляется на каждый run. |
 | **Только свои проекты** | `GET /api/customer/projects` — бэк сам фильтрует по владельцу из JWT. |
 | **Не утомлять вопросами** | Максимум 3 вопроса за ход. Как только собран минимум — предлагаем «давайте я сам напишу ТЗ». |
-| **Два генератора ТЗ** | `creative` (мало инфы → ИИ достраивает, всё придуманное → в `assumptions`) и `strict` (много инфы → ИИ ничего не выдумывает). Выбор по `coverage`. |
-| **Правка ТЗ** | Старое ТЗ скачивается из проекта и кладётся в **скрытый контекст** — в чате его не видно, ИИ просто «уже знаком» с проектом. Правка точечная + `change_summary`. |
-| **Подбор команды** | Без векторной базы: LLM мапит роли на справочники платформы → `GET /public/interns/v2` (ANY по стекам) → LLM ранжирует пул. Результат **только в state**, в БД не пишем. |
-| **«Подобрать ещё»** | `exclude_ids` из state (`candidate_ids`) — на клиенте, т.к. `exclude_for_project_id` в API пока нет. |
+| **Два генератора ТЗ** | `creative` (мало инфы → ИИ достраивает, придуманное → в `assumptions`) и `strict` (много инфы → ничего не выдумывает). Выбор по `coverage`. |
+| **Правка ТЗ** | Старое ТЗ скачивается в **скрытый контекст** — в чате его не видно, ИИ просто «уже знаком» с проектом. Правка точечная + `change_summary`. |
+| **Развилка доработки** | `edit_menu` показывает краткую детерминированную сводку проекта и спрашивает: править ТЗ / подбирать команду / и то, и другое. |
+| **Переподбор по ролям** | При «Доработать ТЗ» refine возвращает `roles_changed`; команду пересматриваем только если состав ролей поменялся. |
+| **Переименование проекта** | Если правки сменили суть, refine предлагает `proposed_title`; `confirm_rename` спрашивает и переименовывает при согласии (PATCH `title`). |
+| **Подбор команды** | Без векторной базы: LLM мапит роли на справочники → `GET /public/interns/v2`. На маршруте «только команда» роли берутся из состава проекта, а если он пуст — извлекаются из текста ТЗ. |
+| **Запись в проект** | После подтверждения подборки в проект пишутся: **состав специалистов** (`required_specialists` из ролей → чипы и `specialists_count`) и **претенденты** (`POST /candidates`, статус POTENTIAL). Роли — первыми, затем претендентов. |
+| **«Подобрать ещё»** | `exclude_ids` из state (`candidate_ids`) — кто уже в списке, не повторяем. |
 | **Конец чата** | После `finalize` любое новое сообщение → детерминированный ответ «заведите новый чат». |
-| **Презентация** | Бизнес-логика заложена целиком: `off` / `local` (python-pptx) / `gamma` (Gamma API, `export_url` временный → качаем сразу). |
+| **Презентация** | `off` / `local` (python-pptx) / `gamma` (Gamma API). Включается `PRESENTATION_PROVIDER`. |
 
 ---
 
 ## Интеграция с API акселератора
 
-Класс `src/api/client.py:AcceleratorAPI` — работает **строго с существующими** ручками:
+Класс `src/api/client.py:AcceleratorAPI` — строго существующие ручки:
 
 | Метод | Ручка |
 |---|---|
 | `get_my_projects_flat()` | `GET /api/customer/projects` |
 | `list_my_projects()` | `GET /api/customer/projects/v2` |
 | `create_project()` | `POST /api/customer/create-project` |
-| `update_project()` | `PATCH /api/customer/{id}` |
+| `update_project()` | `PATCH /api/customer/{id}` (описание, название, `required_specialists`, файлы) |
 | `upload_project_file()` | `POST /api/customer/upload-project-file` |
-| `attach_file_to_project()` | upload → PATCH `files[]` (два шага, как в API) |
+| `attach_file_to_project()` | upload → PATCH `files[]` (два шага) |
+| `add_candidates()` | `POST /api/projects/{id}/candidates` — претенденты (POTENTIAL) |
+| `list_project_invitations()` | `GET /api/projects/{id}/invitations` — для сводки проекта |
 | `search_interns()` | `GET /api/public/interns/v2` |
 | `get_intern()` | `GET /api/public/interns/{id}` |
 | `list_professions()` / `list_stacks()` | `GET /api/public/professions` / `/stacks` |
-| `download_file()` | скачивание файла ТЗ по `file_url` (с кешем) |
+| `download_file()` | скачивание ТЗ по `file_url` (кеш; вся ФС — в отдельном потоке) |
 
-**Чего в API ещё нет** (закрыто на клиенте, ручки не эмулируем):
-- `exclude_for_project_id` у `/interns/v2` → исключаем на клиенте;
-- `/specialists/facets` → используем `/professions` + `/stacks`;
-- `project_invitations` → команда живёт в state.
+**Закрыто на клиенте** (ручки не эмулируем):
+- `exclude_for_project_id` у `/interns/v2` → исключаем уже показанных на клиенте;
+- `/specialists/facets` → используем `/professions` + `/stacks`.
 
 ---
 
-## Запуск (dev + LangSmith)
+## Запуск (uv)
+
+Проект на **uv**.
 
 ```bash
-python3 -m venv venv && source venv/bin/activate
-pip install -e . "langgraph-cli[inmem]"
+uv sync --extra dev          # окружение + dev-инструменты (pytest, ruff, mypy)
 
 cp .env.example .env
 # заполнить: LLM_BASE_URL, LLM_API_KEY, LLM_MODEL,
-#            API_BASE_URL, DEV_USER_TOKEN (JWT заказчика),
-#            LANGSMITH_API_KEY (для трейсинга)
+#            API_BASE_URL, DEV_USER_TOKEN (JWT заказчика для локальной отладки),
+#            LANGSMITH_API_KEY (по желанию — трейсинг)
 
-langgraph dev
+uv run langgraph dev --no-reload
 ```
 
-Studio откроется автоматически. Граф — `customer_agent`.
+`--no-reload` важен: `langgraph dev` держит состояние прерванного прогона
+**в памяти**, а авто-reload при изменении файлов это состояние стирает — пауза
+«повисает» в Studio. Для стабильной локальной работы reload отключаем.
 
-### Как передать токен в Studio
+Короткие обёртки — в `Makefile`:
 
-Токен живёт в **context**, не в state. В Studio открой панель **Configurable** и задай:
+```bash
+make install     # uv sync --extra dev
+make dev         # uv run langgraph dev   (для отладки пауз добавляй --no-reload)
+make test        # uv run pytest -q
+make lint        # uv run ruff check src tests
+make compile     # быстрая проверка, что граф собирается
+```
+
+Studio откроется само. Граф — `customer_agent`.
+
+### Токен в Studio
+
+Токен живёт в **context**, не в state. Панель **Configurable**:
 
 ```json
 { "user_token": "<JWT заказчика>", "api_base_url": "http://localhost:8000" }
 ```
 
-Для быстрой отладки можно вместо этого прописать `DEV_USER_TOKEN` в `.env` —
-узлы возьмут его, если в context токена нет.
+Для быстрой отладки можно прописать `DEV_USER_TOKEN` в `.env` — узлы возьмут его,
+если в context токена нет.
 
-### Первый запуск графа
+### Первый запуск
 
 Input — пустой (`{}`) или с первым сообщением:
 
@@ -124,81 +182,88 @@ Input — пустой (`{}`) или с первым сообщением:
 
 Граф сам сходит за проектами и встанет на паузу с выбором.
 
-### Как отвечать на паузы
+### Ответы на паузы
 
-Граф встаёт на `interrupt` и отдаёт payload:
-
-```json
-{
-  "kind": "select_project",
-  "message": "Вижу ваши проекты — их 3. Доработаем один из них или создадим новый?",
-  "choices": [
-    { "id": "new", "title": "Создать новый проект" },
-    { "id": 42, "title": "Маркетплейс", "status": "draft", "has_spec": true }
-  ]
-}
-```
-
-Ответ — `Command(resume=...)`. В Studio просто вводится значение:
+Граф встаёт на `interrupt` (payload: `kind`, `message`, `choices`/`data`).
+Ответ — `Command(resume=...)`; в Studio вводится значение:
 
 ```json
 { "id": 42 }        // выбрал проект
 { "id": "new" }     // новый проект
-{ "text": "хочу маркетплейс книг, оплата картой" }   // ответ на вопросы
+{ "id": "spec" }    // развилка доработки: spec | team | both
+{ "text": "оплата картой, каталог книг" }   // ответ на вопросы
 { "id": "generate" }  // «составьте ТЗ сами»
 { "id": "ok" }        // подтвердил ТЗ
-{ "id": "more" }      // подобрать ещё специалистов
+{ "id": "yes" }       // согласие переименовать проект
+{ "id": "more" }      // подобрать ещё
+{ "id": "done" }      // подборки достаточно
 ```
 
 ### Типы пауз (контракт с фронтом)
 
-| `kind` | Когда | Что во `choices` / `data` |
+| `kind` | Когда | `choices` / `data` |
 |---|---|---|
 | `select_project` | старт | `choices`: `new` + проекты заказчика |
+| `edit_intent` | доработка проекта | `choices`: `spec` / `team` / `both`; `data.summary` — сводка проекта |
 | `ask_questions` | сбор требований | `data.questions[]` (`id`, `text`, `hint`) |
 | `more_or_generate` | минимум собран | `choices`: `generate` / `more`; `data.missing_topics` |
-| `confirm_spec` | ТЗ готово | `choices`: `ok` / `edit`; `data`: полный ТЗ, `assumptions`, `changes`, `roles_needed` |
+| `confirm_spec` | ТЗ готово | `choices`: `ok` / `edit`; `data`: ТЗ, `assumptions`, `changes`, `roles_needed` |
+| `confirm_rename` | правки сменили суть | `choices`: `yes` / `no` (новое название — в тексте) |
 | `team_ready` | команда подобрана | `choices`: `done` / `more`; `data.team` |
+
+---
+
+## Тесты
+
+Детерминированные, без сети и LLM: маршруты графа, сборка сводки проекта,
+построение HTTP-запросов клиента (через `httpx.MockTransport`), гард на отсутствие
+блокирующей ФС в async `download_file`.
+
+```bash
+make test          # или: uv run pytest -q
+```
+
+Файлы — в `tests/` (`test_routers.py`, `test_summary.py`, `test_client.py`,
+фикстуры в `conftest.py`).
 
 ---
 
 ## Прод
 
-```bash
-langgraph build -t accelerator_agent
-langgraph up --wait          # поднимет LangGraph Server + Postgres + Redis
-```
+Прод-стек — `docker-compose.yml` в корне: Redis (стрим/pub-sub) + Postgres
+(чекпойнтер/`interrupt`-resume) + `langgraph-api` (образ собирается через
+`langgraph build`, тег `accelerator_agent`). Наружу торчит только порт `8123`.
 
-Наружу LangGraph Server **не выставлять** — только через свой FastAPI-шлюз
-(он валидирует заказчика и прокидывает JWT в `context` на каждый run).
+Одной командой (собрать image + поднять весь стек):
 
 ```bash
-ufw allow 22
-ufw allow 8000     # только шлюз
-# 8123 (LangGraph) и 5433 (Postgres) — закрыты
+make prod
 ```
 
----
+Пошагово то же самое:
 
-## Что взято из ML-сервиса
+```bash
+make build_image   # uv run langgraph build -t accelerator_agent
+make up            # docker compose up -d (Redis + Postgres + API)
+```
 
-**Перенесено (ценное):**
-- правила генерации ТЗ: структура документа, иерархическая нумерация, запрет на
-  выдумывание функционала, запрет на разделы «план внедрения/следующие шаги»;
-- точечная правка ТЗ + `change_summary` (из `refine_artifact`);
-- логика оценки достаточности информации (из `requirements_analyzer`) — но без
-  трёх отдельных LLM-вызовов: состояние держит LangGraph;
-- маппинг ролей и отбор кандидатов (из `roles_generation`, `candidate_selector`) —
-  переписаны под реальные фильтры API вместо векторной базы;
-- презентация через Gamma (`export_url` временный → скачиваем сразу).
+Прочие команды:
 
-**Не перенесено (костыли / не в скоупе):**
-- Chroma + `team/match` — подбор идёт через ручки акселератора;
-- ручной чек-лист диалога (`was_asked` / `is_answered`) — это стейт-машина руками,
-  её роль берёт на себя LangGraph;
-- `team_roadmap_pipeline` — императивно сшитый пайплайн, в графе он не нужен;
-- roadmap-генераторы — не в скоупе;
-- транскрибация — по договорённости не делаем.
+```bash
+make restart        # пересобрать image и пересоздать только langgraph-api
+make logs            # логи API (follow)
+make logs_tail        # последние 200 строк логов API
+make ps               # docker compose ps
+make api_ok           # curl http://localhost:8123/ok
+make down             # остановить стек (volumes сохраняются)
+```
+
+`.env` в корне обязателен — из него читаются `LLM_*`, `API_BASE_URL`,
+`LANGSMITH_API_KEY` и т.д.; `REDIS_URI`/`DATABASE_URI` докомпоуз подставляет сам
+(указывают на контейнеры `langgraph-redis`/`langgraph-postgres`).
+
+LangGraph Server **не выставлять** напрямую заказчику — только через свой
+FastAPI-шлюз (валидирует заказчика и прокидывает JWT в `context` на каждый run).
 
 ---
 
@@ -206,19 +271,25 @@ ufw allow 8000     # только шлюз
 
 ```
 src/
-├── core/config.py            # pydantic-settings
+├── core/config.py            # pydantic-settings (.env)
 ├── utils/llm_gen.py          # ChatOpenAI + прокси + ретраи + семафор
 ├── api/
-│   ├── client.py             # AcceleratorAPI — класс с методами
-│   ├── documents.py          # извлечение текста ТЗ (md/docx/pdf)
+│   ├── client.py             # AcceleratorAPI — методы над ручками акселератора
+│   ├── documents.py          # извлечение текста ТЗ (md / docx / pdf)
 │   └── errors.py
-├── requirements_flow/        # сбор требований (вопросы + оценка)
-├── techspec/                 # ТЗ: creative / strict / refine
-├── team/                     # подбор команды
+├── requirements_flow/        # сбор требований (вопросы + оценка достаточности)
+├── techspec/
+│   ├── card.py               # карточка проекта (название + описание) до ТЗ
+│   ├── service.py            # generate / refine ТЗ + извлечение ролей из ТЗ
+│   ├── prompts.py  models.py
+│   └── render.py             # markdown → docx
+├── team/                     # подбор команды (роли → справочники → кандидаты)
+│   ├── service.py  directory.py  prompts.py  models.py
 ├── presentation/             # презентация (off / local / gamma)
 └── graph/
     ├── state.py              # AgentState + Context (токен здесь, не в state)
-    ├── interrupts.py         # human_gate, payload, разбор ответов
-    ├── nodes.py              # узлы
-    └── graph.py              # сборка + условные рёбра
+    ├── interrupts.py         # виды пауз (KIND_*), payload, разбор ответов
+    ├── progress.py           # прогресс в стрим для фронта
+    ├── nodes.py              # узлы графа
+    └── graph.py              # сборка графа + условные рёбра
 ```
