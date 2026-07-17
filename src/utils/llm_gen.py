@@ -130,13 +130,21 @@ def _backoff_seconds(attempt: int, exc: BaseException) -> float:
     return base + random.uniform(0.0, 0.5)
 
 
+# Все вызовы здесь — служебные (structured output: вопросы, оценка полноты,
+# карточка проекта, ТЗ, подбор команды…). Их сырой JSON НЕ предназначен
+# заказчику — юзер-фейсинг текст уходит в чат отдельно, через emit_token/
+# state["messages"]. Без этого тега LangGraph stream_mode="messages" отдаёт
+# фронту эти вызовы как настоящие реплики ассистента (см. TAG_NOSTREAM).
+_NOSTREAM_CONFIG = {"tags": ["nostream"]}
+
+
 async def ainvoke_llm(runnable, messages):
     """Вызывает LLM с процессным семафором и ретраями на 429/сеть/5xx."""
     started = time.monotonic()
     async with _llm_semaphore:
         for attempt in range(1, LLM_RETRY_ATTEMPTS + 1):
             try:
-                return await runnable.ainvoke(messages)
+                return await runnable.ainvoke(messages, config=_NOSTREAM_CONFIG)
             except Exception as exc:  # noqa: BLE001
                 status = _status_code(exc)
                 retryable = _is_retryable(exc)
@@ -207,7 +215,7 @@ async def astream_structured(
         sent = 0
         final = None
         async with _llm_semaphore:
-            async for partial in structured.astream(messages):
+            async for partial in structured.astream(messages, config=_NOSTREAM_CONFIG):
                 final = partial
                 value = _field(partial)
                 if isinstance(value, str) and len(value) > sent:
