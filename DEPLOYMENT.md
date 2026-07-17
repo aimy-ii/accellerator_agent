@@ -103,13 +103,74 @@ ssh accelerator "cd ~/accelerator_agent && docker compose up -d --force-recreate
 
 ## 4. Как достучаться до агента снаружи
 
-### nginx: порт, а не путь на домене
+### Основной способ: путь на домене (HTTPS)
 
-На этом сервере уже сложилась практика: каждый отдельный сервис получает
-**свою пару портов** через системный (не докеровский) nginx —
-`/etc/nginx/sites-available/*-port.conf`. Публичный порт проксирует на
-внутренний, который слушает `127.0.0.1` (не светится в интернет напрямую).
-Мы пошли по этой же схеме — **не** через путь вида `домен/agent/...`.
+У акселератора есть реальный домен с уже выпущенным Let's Encrypt-сертификатом
+— **`https://internship-accelerator.aimy.expert/`**. Он живёт в
+`/etc/nginx/sites-enabled/default` и уже проксирует:
+
+| Путь | Куда |
+|---|---|
+| `/` | фронтенд, `127.0.0.1:8686` |
+| `/api/`, `/docs`, `/openapi.json` | бэкенд акселератора, `127.0.0.1:8000` |
+| **`/agent/`** | **агент (этот репозиторий), `127.0.0.1:18085`** |
+
+Добавленный блок (внутри того же `server { server_name internship-accelerator.aimy.expert; ... }`,
+с SSL от Certbot):
+
+```nginx
+location /agent/ {
+    client_max_body_size 25M;
+    add_header X-Robots-Tag "noindex, nofollow";
+
+    proxy_pass http://127.0.0.1:18085/;
+    proxy_http_version 1.1;
+    proxy_set_header Host $host;
+    proxy_set_header X-Real-IP $remote_addr;
+    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+    proxy_set_header X-Forwarded-Proto $scheme;
+    proxy_set_header X-Forwarded-Host $host;
+
+    proxy_connect_timeout 30s;
+    proxy_send_timeout 300s;
+    proxy_read_timeout 300s;
+
+    # LangGraph стримит ответы через SSE — буферизация/keep-alive-подмена
+    # Connection ломают потоковую печать в чате.
+    proxy_buffering off;
+    proxy_set_header Connection "";
+    chunked_transfer_encoding off;
+}
+```
+
+Важно: `proxy_pass http://127.0.0.1:18085/;` — **со слэшем на конце**, поэтому
+nginx срезает префикс `/agent/` (запрос `/agent/threads` долетает до агента
+как `/threads`). Так что `apiUrl` для SDK — ровно
+`https://internship-accelerator.aimy.expert/agent` (без хвостового слэша),
+а дальше SDK сам добавляет `/threads`, `/runs/stream` и т.д.
+
+После правки конфига — не `restart`, а `reload` (чтобы не рвать чужие
+соединения на этом же nginx, там висит несколько проектов):
+
+```bash
+ssh accelerator "nginx -t && systemctl reload nginx"
+```
+
+Это и есть `apiUrl` для `@langchain/langgraph-sdk` / `useStream` на проде —
+дальше по контракту как в
+[`accellerator_agent_ui/agent-console/INTEGRATION.md`](../accellerator_agent_ui/agent-console/INTEGRATION.md)
+(тот же самый агент, просто другой адрес вместо `localhost:8123`). Плюсы
+такой схемы по сравнению с голым `IP:порт`: HTTPS "из коробки" (сертификат уже
+есть у домена), и фронт с того же домена ходит **same-origin** — никаких
+CORS-танцев на стороне браузера.
+
+### Запасной способ: отдельный порт (без домена)
+
+На сервере есть и старая практика — каждый сервис на своей паре портов через
+системный nginx, `/etc/nginx/sites-available/*-port.conf`, публичный порт →
+внутренний на `127.0.0.1`. Так подняты соседние проекты, и агент по инерции
+тоже получил свою пару — это осталось как диагностический/резервный путь
+(например, если домену/DNS/сертификату что-то не так), **но не как основной**:
 
 | Проект | Публичный порт | Внутренний порт |
 |---|---|---|
@@ -118,62 +179,15 @@ ssh accelerator "cd ~/accelerator_agent && docker compose up -d --force-recreate
 | **accelerator_agent** | **`18084`** | **`18085`** |
 
 Конфиг: `/etc/nginx/sites-available/accelerator-agent-port.conf`
-(симлинк в `sites-enabled/`):
-
-```nginx
-server {
-    listen 18084;
-    listen [::]:18084;
-    server_name _;
-
-    client_max_body_size 25M;
-
-    location / {
-        proxy_pass http://127.0.0.1:18085;
-
-        proxy_http_version 1.1;
-        proxy_set_header Host $host;
-        proxy_set_header X-Real-IP $remote_addr;
-        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
-        proxy_set_header X-Forwarded-Proto $scheme;
-        proxy_set_header X-Forwarded-Host $host;
-
-        proxy_connect_timeout 30s;
-        proxy_send_timeout 300s;
-        proxy_read_timeout 300s;
-
-        # LangGraph стримит ответы через SSE — буферизация/keep-alive-подмена
-        # Connection ломают потоковую печать в чате.
-        proxy_buffering off;
-        proxy_set_header Connection "";
-        chunked_transfer_encoding off;
-    }
-}
-```
-
-После правки конфига — не `restart`, а `reload` (чтобы не рвать чужие
-соединения на этом же nginx):
-
-```bash
-ssh accelerator "nginx -t && systemctl reload nginx"
-```
-
-### Публичный адрес
+(симлинк в `sites-enabled/`) — идентичный `location`-блок, только слушает
+`18084` напрямую по HTTP, без домена/TLS:
 
 ```
 http://185.246.65.131:18084
 ```
 
-Это и есть `apiUrl` для `@langchain/langgraph-sdk` / `useStream` на проде —
-дальше по контракту как в
-[`accellerator_agent_ui/agent-console/INTEGRATION.md`](../accellerator_agent_ui/agent-console/INTEGRATION.md)
-(тот же самый агент, просто другой адрес вместо `localhost:8123`).
-
-Если фронт зовёт агента **с браузера** (не с другого сервера) — нужен либо
-HTTPS+нормальный домен вместо голого `IP:порт`, либо прокси на своей стороне
-(тот же принцип, что и в `agent-console/vite.config.js` — см. INTEGRATION.md,
-раздел про CORS). Сейчас домен/TLS для агента не настроены — это голый HTTP по
-IP, только для внутренних/тестовых интеграций.
+Используй это только для внутренних/тестовых обращений (curl с сервера, отладка) —
+не для браузерного фронта (голый HTTP, никакого домена).
 
 ---
 
@@ -191,7 +205,10 @@ docker logs -f --tail 100 accelerator_agent-langgraph-api-1
 # health (изнутри сервера)
 curl -s http://127.0.0.1:18085/ok
 
-# health снаружи
+# health снаружи, через домен (основной путь)
+curl -s https://internship-accelerator.aimy.expert/agent/ok
+
+# health снаружи, через запасной порт
 curl -s http://185.246.65.131:18084/ok
 ```
 
@@ -203,9 +220,12 @@ curl -s http://185.246.65.131:18084/ok
 - `503` от агента при авторизации — не достучался до бэкенда через
   `host.docker.internal:8000` (бэкенд не поднят / `api_v2` упал — проверяй его
   отдельно, это другой compose-проект).
-- Пустой ответ / обрыв стрима через `:18084`, но напрямую на `127.0.0.1:18085`
-  всё ок — значит поломался nginx-конфиг (`proxy_buffering`/`Connection`) —
-  проверь `nginx -t` и сам конфиг из раздела 4.
+- Пустой ответ / обрыв стрима через домен или `:18084`, но напрямую на
+  `127.0.0.1:18085` всё ок — значит поломался nginx-конфиг
+  (`proxy_buffering`/`Connection`) — проверь `nginx -t` и сам конфиг из
+  раздела 4 (не забудь, что бэкапы старых версий `sites-enabled/default`
+  должны лежать **вне** `sites-enabled/`, иначе nginx их тоже подхватит и
+  выдаст `conflicting server name`).
 
 ---
 
