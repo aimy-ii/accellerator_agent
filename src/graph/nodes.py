@@ -68,22 +68,39 @@ FINISHED_MESSAGE = (
 def _runtime_params(runtime: Runtime[Context]) -> dict:
     """Достаёт параметры run'а. Токен НИКОГДА не берётся из state (он в чекпоинте).
 
-    Ищем в двух местах, потому что передать его можно по-разному:
-      1. context=  — нативный способ LangGraph 1.x (`graph.ainvoke(..., context={...})`);
-      2. config["configurable"] — так шлёт SDK/Studio (`runs.stream(config={"configurable": {...}})`).
-    Fallback — DEV_USER_TOKEN из .env, только для локальной отладки.
+    Источники токена по приоритету:
+      1. config["configurable"]["langgraph_auth_user"]["user_token"] — прод: токен
+         разложил хук `@auth.authenticate` (src/auth.py) из заголовка Authorization
+         Bearer, который фронт шлёт один раз за запрос.
+      2. context= / config["configurable"]["user_token"] — совместимость: нативный
+         способ LangGraph 1.x (`graph.ainvoke(..., context={...})`) и то, как шлёт
+         Studio (`runs.stream(config={"configurable": {...}})`) без нашего auth-хука.
+      3. DEV_USER_TOKEN из .env — только для локальной отладки.
     """
     params: dict = dict(runtime.context or {})
 
+    try:
+        configurable = (get_config() or {}).get("configurable") or {}
+    except Exception:  # noqa: BLE001
+        configurable = {}
+
+    # 1. Прод: токен из auth-контекста run'а — наивысший приоритет, перетирает
+    # то, что могло прийти в context/configurable напрямую.
+    auth_user = configurable.get("langgraph_auth_user")
+    auth_token = auth_user.get("user_token") if auth_user is not None else None
+    if auth_token:
+        params["user_token"] = auth_token
+
+    # 2. Совместимость (Studio / прямой вызов графа) — fallback, если auth-хук
+    # токен не положил.
     if not params.get("user_token"):
-        try:
-            configurable = (get_config() or {}).get("configurable") or {}
-        except Exception:  # noqa: BLE001
-            configurable = {}
         for key in ("user_token", "api_base_url"):
             if not params.get(key) and configurable.get(key):
                 params[key] = configurable[key]
+    elif not params.get("api_base_url") and configurable.get("api_base_url"):
+        params["api_base_url"] = configurable["api_base_url"]
 
+    # 3. Локалка.
     if not params.get("user_token") and settings.dev_user_token:
         params["user_token"] = settings.dev_user_token
 

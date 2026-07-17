@@ -28,6 +28,16 @@ class Settings(BaseSettings):
     # В проде токен приходит в context (configurable.user_token) на каждый run.
     dev_user_token: str | None = None
 
+    # ─── Аутентификация агента (introspection-ручка акселератора) ──────────
+    # URL ручки интроспекции пользовательского JWT (POST {token, agent_name}).
+    agent_introspect_url: str = "http://localhost:8000/api/internal/auth/introspect"
+    # s2s-токен агента — заголовок X-Service-Token. В проде обязателен.
+    agent_introspect_token: str | None = None
+    # Имя агента, которое шлём в ручку (маппинг AGENT_ROLES на бэкенде).
+    agent_name: str = "customer_agent"
+    # Рубильник auth. False — только локальная отладка (без похода в ручку).
+    auth_enabled: bool = True
+
     # ─── LLM (OpenRouter / kodik_router / локальная — OpenAI-совместимая) ────
     llm_base_url: str | None = None
     llm_api_key: str | None = None
