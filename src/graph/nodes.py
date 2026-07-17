@@ -424,8 +424,15 @@ async def ask_questions_node(state: AgentState, runtime: Runtime[Context]) -> di
     if _skip_on_error(state):
         return {}
 
+    is_first_round = not state.get("question_rounds")
+    thinking_text = (
+        "Читаю вашу идею, формулирую первые вопросы…"
+        if is_first_round
+        else "Читаю ваш ответ, оцениваю, чего ещё не хватает…"
+    )
+
     try:
-        emit("ask_questions", "Думаю, что уточнить…", "start")
+        emit("ask_questions", thinking_text, "start")
         batch = await next_questions(
             _dialog(state),
             spec_context=state.get("existing_spec_text"),
