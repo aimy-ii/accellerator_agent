@@ -76,6 +76,7 @@ class AgentState(TypedDict, total=False):
     spec_changes: list[str]         # что изменилось (режим edit)
     roles_needed: list[str]
     roles_changed: bool             # правки ТЗ изменили состав ролей (из refine)
+    execution_days: Optional[int]   # ориентировочный срок в календарных днях (из ТЗ)
     spec_file_url: Optional[str]    # ТЗ, прикреплённое к проекту
     spec_confirmed: bool            # заказчик подтвердил ТЗ (роутер читает это, не текст)
 
