@@ -11,7 +11,7 @@ from src.graph.nodes import (
 def test_summary_with_spec_file(project_with_spec, invitations_sample):
     text = build_edit_summary(project_with_spec, invitations_sample)
     assert "Бот для записи к врачу" in text
-    assert "файл прикреплён" in text
+    assert "— файл проекта: TZ_bot_20260101.docx" in text
     assert "требуется по проекту: 3" in text
     assert "откликов от специалистов: 4" in text
     # два potential, один accepted
@@ -21,12 +21,55 @@ def test_summary_with_spec_file(project_with_spec, invitations_sample):
 
 def test_summary_without_spec_file(project_no_spec):
     text = build_edit_summary(project_no_spec, [])
-    assert "файла нет" in text
+    assert "— файлов пока нет" in text
     # состав специалистов не задан (0) — строку про «требуется» не показываем
     assert "требуется по проекту" not in text
     # приглашений нет → счётчики нулевые, но строки присутствуют
     assert "претендентов (наброски подборки): 0" in text
     assert "в команде (приняли приглашение): 0" in text
+
+
+def test_summary_lists_all_files(project_with_spec):
+    project_with_spec["files"] = [
+        {
+            "file_name": "TZ_bot.docx",
+            "file_url": "/api/static/project_files/aa.docx",
+            "mime_type": (
+                "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+            ),
+        },
+        {
+            "file_name": "presentation_42.pptx",
+            "file_url": "/api/static/project_files/bb.pptx",
+            "mime_type": (
+                "application/vnd.openxmlformats-officedocument.presentationml.presentation"
+            ),
+        },
+        {
+            "file_name": "cover.png",
+            "file_url": "/api/static/project_files/cc.png",
+            "mime_type": "image/png",
+        },
+    ]
+    text = build_edit_summary(project_with_spec, [])
+    # три файла в одной строке, через запятую
+    assert "— файлы проекта: TZ_bot.docx, presentation_42.pptx, cover.png" in text
+
+
+def test_summary_single_file_uses_singular_label(project_with_spec):
+    project_with_spec["files"] = [
+        {
+            "file_name": "TZ_only.docx",
+            "file_url": "/api/static/project_files/xx.docx",
+            "mime_type": (
+                "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+            ),
+        },
+    ]
+    text = build_edit_summary(project_with_spec, [])
+    assert "— файл проекта: TZ_only.docx" in text
+    # Ни в единственном, ни во множественном — старой формулировки уже нет.
+    assert "файл прикреплён" not in text
 
 
 def test_summary_invitations_unknown_omits_counts(project_with_spec):

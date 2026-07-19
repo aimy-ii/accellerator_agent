@@ -13,6 +13,18 @@ log = logging.getLogger(__name__)
 
 _TEXT_EXT = (".md", ".markdown", ".txt")
 _SPEC_HINTS = ("тз", "техзадание", "tech", "spec", "техническое")
+_PPTX_EXTS = (".pptx", ".ppt")
+_PPTX_MIMES = frozenset({
+    "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+    "application/vnd.ms-powerpoint",
+})
+
+
+def is_presentation_file(file: dict) -> bool:
+    """True, если файл проекта — презентация (по MIME или расширению)."""
+    mime = (file.get("mime_type") or "").lower()
+    name = (file.get("file_name") or "").lower()
+    return mime in _PPTX_MIMES or name.endswith(_PPTX_EXTS)
 
 
 def _is_pdf(data: bytes) -> bool:
@@ -73,7 +85,10 @@ def _extract_docx(data: bytes) -> str:
 def pick_spec_file(files: list[dict]) -> dict | None:
     """Выбирает из файлов проекта тот, что похож на ТЗ.
 
-    Приоритет: имя содержит «тз/техзадание/spec» → иначе первый .md → иначе первый файл.
+    Приоритет: имя содержит «тз/техзадание/spec» → иначе первый .md/.txt →
+    иначе первый файл, не являющийся презентацией. Если ничего кроме
+    презентаций в проекте нет — возвращаем None (иначе extract_text
+    попробует разобрать .pptx как .docx и вернёт мусор — оба ZIP).
     """
     if not files:
         return None
@@ -87,4 +102,8 @@ def pick_spec_file(files: list[dict]) -> dict | None:
         if (f.get("file_name") or "").lower().endswith(_TEXT_EXT):
             return f
 
-    return files[0]
+    for f in files:
+        if not is_presentation_file(f):
+            return f
+
+    return None
