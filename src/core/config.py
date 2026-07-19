@@ -70,7 +70,7 @@ class Settings(BaseSettings):
     candidates_pool_size: int = 30
 
     # ─── Презентация (бизнес-логика; провайдер gamma|local|off) ─────────────
-    presentation_provider: str = "off"
+    presentation_provider: str = "gamma"
     gamma_api_key: str | None = None
     gamma_base_url: str = "https://public-api.gamma.app/v1.0"
     gamma_export_as: str = "pptx"

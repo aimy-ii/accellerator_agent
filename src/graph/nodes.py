@@ -594,6 +594,7 @@ async def generate_spec_node(state: AgentState, runtime: Runtime[Context]) -> di
         "spec_text": spec.tech_spec_text,
         "spec_assumptions": spec.assumptions,
         "roles_needed": spec.roles_needed,
+        "execution_days": spec.execution_days,
         "messages": [AIMessage(content="Техническое задание готово.")],
     }
 
@@ -627,12 +628,19 @@ async def refine_spec_node(state: AgentState, runtime: Runtime[Context]) -> dict
     proposed_title = proposed if proposed and proposed != current_title else None
 
     emit("refine_spec", "Правки внесены", "done")
+    # Если модель не вернула срок — сохраняем прежнюю оценку из state.
+    execution_days = (
+        refined.execution_days
+        if refined.execution_days is not None
+        else state.get("execution_days")
+    )
     return {
         "spec_text": refined.tech_spec_text,
         "spec_changes": refined.change_summary,
         "roles_needed": refined.roles_needed or state.get("roles_needed") or [],
         "roles_changed": bool(refined.roles_changed),
         "proposed_title": proposed_title,
+        "execution_days": execution_days,
         "spec_summary": state.get("spec_summary")
         or "Обновлённое техническое задание проекта",
     }
@@ -741,6 +749,40 @@ async def confirm_rename_node(state: AgentState, runtime: Runtime[Context]) -> d
 
 # ─── 6. прикрепление файла ТЗ (параллельно с подбором) ──────────────────────
 
+def _build_project_patch(
+    *,
+    mode: str | None,
+    spec_summary: str | None,
+    rename_confirmed: bool,
+    spec_title: str | None,
+    execution_days: int | None,
+) -> dict:
+    """Собирает патч для PATCH /customer/{project_id} после подтверждения ТЗ.
+
+    - в create: patch только с execution_days (если модель оценила срок);
+      title/description проекта уже заданы при create_project;
+    - в edit: description всегда (сейчас так и есть), title при rename_confirmed,
+      execution_days добавляем к общему патчу.
+
+    execution_days фильтруется: пишем только целые >= 1 (бэкенд принимает ge=1).
+    """
+    patch: dict = {}
+    if mode == "edit":
+        patch["description"] = spec_summary or ""
+        if rename_confirmed and (spec_title or "").strip():
+            patch["title"] = spec_title
+
+    if execution_days is not None:
+        try:
+            days = int(execution_days)
+        except (TypeError, ValueError):
+            days = 0
+        if days >= 1:
+            patch["execution_days"] = days
+
+    return patch
+
+
 async def attach_spec_node(state: AgentState, runtime: Runtime[Context]) -> dict:
     """Прикрепляет файл ТЗ к проекту. Идёт ПАРАЛЛЕЛЬНО с подбором команды.
 
@@ -761,11 +803,14 @@ async def attach_spec_node(state: AgentState, runtime: Runtime[Context]) -> dict
     try:
         emit("attach_spec", "Сохраняю ТЗ в проект…", "start")
 
-        if state.get("mode") == "edit":
-            patch = {"description": state.get("spec_summary") or ""}
-            # Заказчик согласился переименовать — обновляем и название проекта.
-            if state.get("rename_confirmed") and (state.get("spec_title") or "").strip():
-                patch["title"] = state.get("spec_title")
+        patch = _build_project_patch(
+            mode=state.get("mode"),
+            spec_summary=state.get("spec_summary"),
+            rename_confirmed=bool(state.get("rename_confirmed")),
+            spec_title=state.get("spec_title"),
+            execution_days=state.get("execution_days"),
+        )
+        if patch:
             await api.update_project(int(project_id), patch)
 
         version = 2 if state.get("mode") == "edit" else 1

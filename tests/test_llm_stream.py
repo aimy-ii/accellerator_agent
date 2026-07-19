@@ -9,7 +9,9 @@ class _FakeStructured:
         self._chunks = chunks
         self.astream_called = False
 
-    async def astream(self, messages):
+    # config= принимает настоящий Runnable из LangChain; фейк обязан
+    # соответствовать этому интерфейсу — прод шлёт nostream-тег через config.
+    async def astream(self, messages, config=None):
         self.astream_called = True
         for chunk in self._chunks:
             yield chunk
@@ -37,7 +39,7 @@ async def test_astream_structured_deltas():
 
 async def test_astream_structured_fallback_on_error(monkeypatch):
     class _Broken:
-        async def astream(self, messages):
+        async def astream(self, messages, config=None):
             raise RuntimeError("stream failed")
             yield  # noqa: RET503 — делаем async generator
 
