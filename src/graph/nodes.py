@@ -314,15 +314,17 @@ def build_edit_summary(
     показываем (не путаем «0» с «неизвестно»).
     """
     title = project.get("title") or f"Проект #{project.get('id')}"
-    has_spec = bool(pick_spec_file(project.get("files") or []))
     responses = int(project.get("responses_count") or 0)
     required = int(project.get("specialists_count") or 0)
 
+    files = project.get("files") or []
     lines = [f"Проект «{title}»:"]
-    lines.append(
-        "— техническое задание: "
-        + ("файл прикреплён" if has_spec else "файла нет, есть только описание")
-    )
+    if files:
+        names = ", ".join((f.get("file_name") or "без имени") for f in files)
+        label = "файл проекта" if len(files) == 1 else "файлы проекта"
+        lines.append(f"— {label}: {names}")
+    else:
+        lines.append("— файлов пока нет, есть только описание")
     if required:
         lines.append(f"— требуется по проекту: {required} чел.")
     lines.append(f"— откликов от специалистов: {responses}")
